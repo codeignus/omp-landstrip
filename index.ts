@@ -1,0 +1,2684 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) Jarkko Sakkinen 2026
+
+import { type ChildProcess, spawn, spawnSync, type StdioOptions } from 'node:child_process';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { type AddressInfo, createServer, Socket as NetSocket } from 'node:net';
+import { tmpdir } from 'node:os';
+import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
+import { fileURLToPath } from 'node:url';
+
+import type {
+  AgentToolResult,
+  AgentToolUpdateCallback,
+  BashToolDetails,
+  BashToolInput,
+  ExtensionAPI,
+  ExtensionContext,
+} from '@earendil-works/pi-coding-agent';
+
+import {
+  type BashOperations,
+  createBashToolDefinition,
+  getAgentDir,
+  getShellConfig,
+  SettingsManager,
+  withFileMutationQueue,
+} from '@earendil-works/pi-coding-agent';
+import {
+  binaryPath,
+  type LandstripControlResponse,
+  type LandstripFilesystemTrap,
+  type LandstripNetworkTrap,
+  type LandstripPolicy,
+  type SandboxConfig as BaseSandboxConfig,
+  type SandboxConfigFile,
+  type SandboxFilesystemConfig,
+  type SandboxShellConfig,
+  type SandboxWindowsConfig,
+  type ShellReadAccess,
+} from '@landstrip/landstrip-api';
+import {
+  buildLandstripPolicy as assembleLandstripPolicy,
+  allowsAllDomains,
+  controlResponseLine,
+  deepMergeSandboxConfig as deepMerge,
+  domainMatchesAny,
+  evaluateDomainAccess,
+  formatLandstripTraps,
+  isDenialTrap,
+  isFilesystemTrap,
+  isPathReadAllowed,
+  isRecord,
+  isQueryTrap,
+  matchesPathPattern,
+  mergeArray,
+  parseLandstripTraps,
+  parseSandboxConfig,
+  canonicalizeGlobPattern,
+  canonicalizePath,
+  expandPath,
+  globToRegExp,
+  normalizePathSeparators,
+  parseTrapLine,
+  pathUnderDirectory,
+  sessionScopeFor,
+  serializeLandstripPolicy,
+  shouldPromptForWrite as sharedShouldPromptForWrite,
+  normalizeBlockedPath,
+  extractNativeDeniedPath,
+  extractNativeWriteDeniedPath,
+  extractDeniedPath,
+  extractTrapBlockedPath,
+} from '@landstrip/landstrip-api/shared';
+import {
+  type ProxyPortRange,
+  createProxyCredentials,
+  createProxyEnvironment,
+  startFilterProxy,
+} from '@landstrip/landstrip-api/proxy';
+
+export {
+  controlResponseLine,
+  domainMatchesAny,
+  extractDeniedPath,
+  extractNativeDeniedPath,
+  extractNativeWriteDeniedPath,
+  formatLandstripTraps,
+  isQueryTrap,
+  parseTrapLine,
+  sessionScopeFor,
+  type ShellReadAccess,
+};
+
+export interface SandboxConfig extends BaseSandboxConfig {
+  shell: SandboxShellConfig;
+  windows: SandboxWindowsConfig;
+}
+import {
+  type LandstripContextV2,
+  type LandstripEvent,
+  type LandstripPermissionAskDecision,
+  type LandstripPermissionAskProvider,
+  type LandstripPermissionAskRequest,
+  type LandstripPreparedProcess,
+  type LandstripProcessOptions,
+  type LandstripSandboxState,
+  type LandstripShellInvocation,
+  type LandstripShellPrepareOptions,
+  type LandstripShellProvider,
+  type LandstripWorkerExtension,
+  LANDSTRIP_RUNTIME_VERSION,
+  type PiLandstripRuntimeV2,
+  publishLandstripRuntime,
+} from './api.ts';
+import type { RpcSpawn } from './rpc-process.ts';
+import { WORKER_AUTH_FD } from './worker-auth-channel.ts';
+import {
+  registerSubagents,
+  registerSubagentWorker,
+  workerConfigFromEnvironment,
+} from './subagents.ts';
+import { getPiConfigPaths } from './config.ts';
+import { formatError, PermissionPromptCoordinator } from './util.ts';
+
+type LandstripBashTool = ReturnType<typeof createBashToolDefinition>;
+
+export type SandboxConfigScope = 'global' | 'project';
+
+export type PolicyAudience = 'shell' | 'worker';
+
+export function enforcesShellReadPolicy(
+  shellReadAccess: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return shellReadAccess !== 'host' || platform === 'win32';
+}
+
+export function resolveProcessReadPolicy(
+  audience: PolicyAudience,
+  shellReadAccess: ShellReadAccess,
+  denyRead: string[],
+  allowRead: string[],
+  platform: NodeJS.Platform = process.platform,
+): Pick<SandboxFilesystemConfig, 'denyRead' | 'allowRead'> {
+  if (audience === 'shell' && !enforcesShellReadPolicy(shellReadAccess, platform)) {
+    return { denyRead: [], allowRead: [] };
+  }
+  return { denyRead, allowRead };
+}
+
+interface LandstripBashCallbacks {
+  onStderr?: (data: Buffer) => void;
+  onErrorFd?: (data: Buffer) => void;
+  promptOnBlock?: boolean;
+}
+
+interface ExecutionAllowances {
+  readonly permissionPromptLabel?: string;
+  // Present only for worker launches; never let a broker approve these rules.
+  explicitDenyRead?: { patterns: string[]; globRoots: Map<string, string[]> };
+  readonly protectedPaths?: string[];
+  readonly domains: string[];
+  readonly readPaths: string[];
+  readonly writePaths: string[];
+  readonly targets: string[];
+}
+
+const SUPPORTED_PLATFORMS = new Set<NodeJS.Platform>(['linux', 'darwin', 'win32']);
+// Grace period after the child exits for its stdio to drain before we stop
+// waiting; matches pi's own bash backend so a backgrounded process cannot hang us.
+const EXIT_STDIO_GRACE_MS = 100;
+
+const packageDir = dirname(fileURLToPath(import.meta.url));
+type PermissionChoice = 'abort' | 'once' | 'session' | 'project' | 'global';
+type NotificationLevel = Parameters<ExtensionContext['ui']['notify']>[1];
+
+interface PromptOption {
+  label: string;
+  action: PermissionChoice;
+  confirm?: boolean;
+  hint?: string;
+}
+
+const PERMISSION_OPTIONS: PromptOption[] = [
+  { label: 'Allow once', action: 'once' },
+  { label: 'Allow for this session', action: 'session' },
+  {
+    label: 'Allow for this project',
+    action: 'project',
+    confirm: true,
+    hint: 'save to .pi/sandbox.json',
+  },
+  {
+    label: 'Allow for all projects',
+    action: 'global',
+    confirm: true,
+    hint: 'save to ~/.pi/agent/sandbox.json',
+  },
+  { label: 'Keep blocked', action: 'abort' },
+];
+
+const NETWORK_PERMISSION_OPTIONS: PromptOption[] = [
+  { label: 'Allow once', action: 'once' },
+  { label: 'Allow for this session', action: 'session' },
+  { label: 'Keep blocked', action: 'abort' },
+];
+
+function loadSandboxConfig(
+  cwd: string,
+  includeProject: boolean,
+): SandboxConfig & { explicitDenyRead: string[] } {
+  const projectConfigPath = join(cwd, '.pi', 'sandbox.json');
+  const globalConfigPath = join(getAgentDir(), 'sandbox.json');
+
+  if (!existsSync(globalConfigPath)) {
+    mkdirSync(dirname(globalConfigPath), { recursive: true });
+    writeFileSync(globalConfigPath, '{}\n', 'utf-8');
+  }
+
+  const globalOverrides = readOrEmptyConfig(globalConfigPath);
+  const projectOverrides = includeProject ? readOrEmptyConfig(projectConfigPath) : {};
+  const globalConfig = deepMerge(
+    JSON.parse(readFileSync(join(packageDir, 'sandbox.json'), 'utf-8')),
+    globalOverrides,
+  );
+
+  return {
+    ...deepMerge(globalConfig, projectOverrides),
+    // Persisted rules are explicit, even when identical to an internal default.
+    explicitDenyRead: mergeArray(
+      globalOverrides.filesystem?.denyRead ?? [],
+      projectOverrides.filesystem?.denyRead,
+    ),
+  };
+}
+
+type WindowsImplementation = 'appContainer' | 'restrictedUser';
+
+interface WindowsStatus {
+  active: WindowsImplementation;
+  installed: boolean;
+  healthy: boolean;
+  proxyPortLow?: number;
+  proxyPortHigh?: number;
+}
+
+function windowsStatus(): WindowsStatus {
+  const result = spawnSync(binaryPath(), ['windows', 'status'], {
+    encoding: 'utf-8',
+    windowsHide: true,
+  });
+  if (result.error) throw result.error;
+
+  let status: WindowsStatus;
+  try {
+    status = JSON.parse(result.stdout) as WindowsStatus;
+  } catch {
+    throw new Error(result.stderr.trim() || 'Windows sandbox status check failed');
+  }
+  if (result.status !== 0 || status.healthy !== true) {
+    throw new Error(
+      result.stderr.trim() ||
+        'The Windows restricted-user installation is unhealthy. Run "landstrip windows status".',
+    );
+  }
+  return status;
+}
+
+function shouldStartProxy(config: SandboxConfig): boolean {
+  if (config.network.allowNetwork) return false;
+  return (
+    process.platform !== 'win32' ||
+    windowsStatus().active === 'restrictedUser' ||
+    config.windows.allowLoopback
+  );
+}
+
+function restrictedUserProxyPortRange(): ProxyPortRange | undefined {
+  if (process.platform !== 'win32') return undefined;
+
+  const status = windowsStatus();
+  if (status.active === 'appContainer') return undefined;
+  if (
+    status.installed !== true ||
+    !Number.isInteger(status.proxyPortLow) ||
+    !Number.isInteger(status.proxyPortHigh) ||
+    status.proxyPortLow! < 1 ||
+    status.proxyPortHigh! < status.proxyPortLow!
+  ) {
+    throw new Error(
+      'The Windows restricted-user installation is unhealthy. Run "landstrip windows status".',
+    );
+  }
+  return { low: status.proxyPortLow!, high: status.proxyPortHigh! };
+}
+
+function readOrEmptyConfig(configPath: string): SandboxConfigFile {
+  if (!existsSync(configPath)) return {};
+  try {
+    return parseSandboxConfig(JSON.parse(readFileSync(configPath, 'utf-8')));
+  } catch (error) {
+    throw new Error(`${configPath}: ${formatError(error)}`);
+  }
+}
+
+function writeConfigFile(configPath: string, config: SandboxConfigFile): void {
+  mkdirSync(dirname(configPath), { recursive: true });
+  writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf-8');
+}
+
+function getSandboxConfigWriteTarget(
+  cwd: string,
+  includeProject = true,
+): { scope: SandboxConfigScope; path: string } {
+  const { globalPath, projectPath } = getPiConfigPaths(cwd, 'sandbox.json');
+  return includeProject
+    ? { scope: 'project', path: projectPath }
+    : { scope: 'global', path: globalPath };
+}
+
+async function writeSandboxConfigEnabled(
+  cwd: string,
+  enabled: boolean | undefined,
+  scope: SandboxConfigScope,
+): Promise<void> {
+  const paths = getPiConfigPaths(cwd, 'sandbox.json');
+  const path = scope === 'project' ? paths.projectPath : paths.globalPath;
+  await withFileMutationQueue(path, async () => {
+    const config = readOrEmptyConfig(path);
+    if (enabled === undefined) delete config.enabled;
+    else config.enabled = enabled;
+    writeConfigFile(path, config);
+  });
+}
+
+function loadSandboxEnabledSettings(
+  cwd: string,
+  includeProject: boolean,
+): { global: boolean; project?: boolean } {
+  const { projectPath } = getPiConfigPaths(cwd, 'sandbox.json');
+  const global = loadSandboxConfig(cwd, false).enabled;
+  if (!includeProject || !existsSync(projectPath)) return { global };
+  const project = readOrEmptyConfig(projectPath).enabled;
+  return { global, project };
+}
+
+async function addConfigValue(
+  configPath: string,
+  value: string,
+  readValues: (config: SandboxConfigFile) => string[],
+  writeValues: (config: SandboxConfigFile, values: string[]) => void,
+): Promise<void> {
+  await withFileMutationQueue(configPath, async () => {
+    const config = readOrEmptyConfig(configPath);
+    const existing = readValues(config);
+    if (existing.includes(value)) return;
+    writeValues(config, [...existing, value]);
+    writeConfigFile(configPath, config);
+  });
+}
+
+function mergeAllowances(base: string[], session: string[], execution?: string[]): string[] {
+  return [...base, ...session, ...(execution ?? [])];
+}
+
+export function shouldPromptForWrite(path: string, allowWrite: string[], cwd: string): boolean {
+  return sharedShouldPromptForWrite(path, allowWrite, cwd);
+}
+
+export function matchesPattern(
+  filePath: string,
+  patterns: string[],
+  cwd: string,
+  explicitDenyGlobRoots?: Map<string, string[]>,
+): boolean {
+  if (!explicitDenyGlobRoots) {
+    return matchesPathPattern(filePath, patterns, cwd);
+  }
+  const abs = normalizePathSeparators(canonicalizePath(filePath, cwd));
+
+  return patterns.some((pattern) => {
+    const absPattern = normalizePathSeparators(canonicalizeGlobPattern(pattern, cwd));
+
+    if (/[*?[\]]/.test(pattern)) {
+      // Mirror landstrip's matcher: `**/` spans directories, `**` spans any run,
+      // but a single `*` stops at `/` — so `/srv/*/pub` cannot reach
+      // `/srv/a/secret/pub`. Compiling `*` to `.*` would over-match across `/`.
+      const matcher = globToRegExp(absPattern);
+      // Native glob matches name directory roots as well as files. Descendants
+      // inherit the matched directory's rule, including paths not created yet.
+      for (let candidate = abs; ;) {
+        if (matcher.test(candidate)) return true;
+        const parent = normalizePathSeparators(dirname(candidate));
+        if (parent === candidate) break;
+        candidate = parent;
+      }
+
+      // Only explicit worker denies need native glob lowering. Retain the
+      // canonical roots per worker so trap queries never repeat the traversal.
+      if (!explicitDenyGlobRoots) return false;
+      let roots = explicitDenyGlobRoots.get(absPattern);
+      if (!roots) {
+        const resolvedRoots: string[] = [];
+        const wildcard = absPattern.search(/[*?[\]]/);
+        const base = absPattern.slice(0, absPattern.lastIndexOf('/', wildcard) + 1);
+        const suffix = absPattern.slice(base.length);
+        const segments = suffix.match(/(?:\[[^\]]*\]|[^/])+/g) ?? [];
+        const recursive = suffix.includes('**');
+        const visit = (directory: string, depth: number): void => {
+          if (depth >= 40) throw new Error(`Glob traversal depth exceeded for "${pattern}"`);
+          let entries;
+          try {
+            entries = readdirSync(directory, { withFileTypes: true });
+          } catch (error) {
+            if (
+              isRecord(error) &&
+              ['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM'].includes(String(error.code))
+            ) {
+              return;
+            }
+            throw error;
+          }
+          for (const entry of entries) {
+            const candidate = normalizePathSeparators(join(directory, entry.name));
+            // Match the alias before canonicalizing: `/runtime/ali*` can lower
+            // to a root such as `/opt/worker` that does not match lexically.
+            if (entry.isSymbolicLink() && matcher.test(candidate)) {
+              resolvedRoots.push(normalizePathSeparators(canonicalizePath(candidate, cwd)));
+            }
+            // Like native expansion, never descend through a symlink. Without
+            // globstars, prune directories that cannot match the next segment.
+            if (
+              entry.isDirectory() &&
+              (recursive ||
+                (depth + 1 < segments.length && globToRegExp(segments[depth]!).test(entry.name)))
+            ) {
+              visit(candidate, depth + 1);
+            }
+          }
+        };
+        visit(base, 0);
+        roots = resolvedRoots;
+        explicitDenyGlobRoots.set(absPattern, roots);
+      }
+      return roots.some(
+        (target) => abs === target || abs.startsWith(target.endsWith('/') ? target : `${target}/`),
+      );
+    }
+
+    const sep = absPattern.endsWith('/') ? '' : '/';
+    return abs === absPattern || abs.startsWith(absPattern + sep);
+  });
+}
+
+export function readAllowed(
+  path: string,
+  allowRead: string[],
+  denyRead: string[],
+  cwd: string,
+): boolean {
+  return isPathReadAllowed(path, allowRead, denyRead, cwd);
+}
+
+function extractDeniedPathMention(
+  output: string,
+  cwd: string,
+  denied: (path: string) => boolean,
+): string | null {
+  const start = /(?<=^|['"`\s=:(])(?=\/|[a-zA-Z]:[\\/])/g;
+  for (const line of output.split(/\r?\n/)) {
+    for (const match of line.matchAll(start)) {
+      const raw = line.slice(match.index);
+      const quoted = raw.match(/^([^'"`]+)['"`]/);
+      const words = (quoted ? quoted[1] : raw).replace(/[.,:;)\]]+$/, '').split(' ');
+      for (let count = words.length; count > 0; count -= 1) {
+        const candidate = words.slice(0, count).join(' ');
+        if (!existsSync(candidate)) continue;
+        const path = normalizeBlockedPath(candidate, cwd);
+        if (denied(path)) return path;
+        break;
+      }
+    }
+  }
+  return null;
+}
+
+export function extractRetryableNativeReadDeniedPath(
+  output: string,
+  cwd: string,
+  allowRead: string[],
+  denyRead: string[],
+): string | null {
+  const denied = (path: string): boolean => !readAllowed(path, allowRead, denyRead, cwd);
+  const path = extractNativeDeniedPath(output, cwd);
+  if (path) return denied(path) ? path : null;
+  return extractDeniedPathMention(output, cwd, denied);
+}
+
+function notify(ctx: ExtensionContext, message: string, level: NotificationLevel): void {
+  if (!ctx.hasUI) return;
+  ctx.ui.notify(message, level);
+}
+
+function hasTuiStatus(ctx: ExtensionContext): boolean {
+  if (!ctx.hasUI) return false;
+  const mode = ctx.mode;
+  return mode === undefined || mode === 'tui';
+}
+
+function setTuiStatus(ctx: ExtensionContext, key: string, value: string | undefined): void {
+  if (!hasTuiStatus(ctx)) return;
+  ctx.ui.setStatus(key, value);
+}
+
+function patchProcessGroupKill(child: ChildProcess): void {
+  const kill = child.kill.bind(child);
+  child.kill = (signal?: NodeJS.Signals | number): boolean => {
+    if (signal === 0 || child.pid === undefined) return kill(signal);
+    if (process.platform === 'win32') {
+      const result = spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      if (result.status === 0) return true;
+    } else {
+      try {
+        process.kill(-child.pid, signal);
+        return true;
+      } catch {
+        // Fall back when the process exited before its group was signalled.
+      }
+    }
+    return kill(signal);
+  };
+}
+
+async function stopPreparedChild(child: ChildProcess | undefined): Promise<void> {
+  if (!child) return;
+
+  child.kill('SIGKILL');
+  if (child.exitCode !== null || child.signalCode !== null) return;
+
+  await new Promise<void>((resolve) => {
+    let settleTimer: NodeJS.Timeout | undefined;
+    const done = (): void => {
+      if (settleTimer) clearTimeout(settleTimer);
+      child.removeListener('exit', done);
+      resolve();
+    };
+    child.once('exit', done);
+    settleTimer = setTimeout(done, 1_000);
+  });
+}
+
+async function showPermissionPrompt(
+  ctx: ExtensionContext,
+  title: string,
+  options: PromptOption[],
+  signal?: AbortSignal,
+  label?: string,
+): Promise<PermissionChoice> {
+  if (!ctx.hasUI) return 'abort';
+
+  const labels = options.map((option) =>
+    option.hint ? `${option.label} — ${option.hint}` : option.label,
+  );
+  const selected = await ctx.ui.select(label ? `${label}\n${title}` : title, labels, { signal });
+  if (signal?.aborted) return 'abort';
+  const index = selected === undefined ? -1 : labels.indexOf(selected);
+  const option = options[index];
+  if (!option) return 'abort';
+  if (option.confirm) {
+    const confirmed = await ctx.ui.confirm(
+      label ? `${label}\nSave this permission?` : 'Save this permission?',
+      `${title}\n\n${option.hint ?? 'This changes persisted sandbox policy.'}`,
+      { signal },
+    );
+    if (!confirmed || signal?.aborted) return 'abort';
+  }
+  return option.action;
+}
+
+function promptReadBlock(
+  ctx: ExtensionContext,
+  filePath: string,
+  reason?: string,
+  signal?: AbortSignal,
+  label?: string,
+): Promise<PermissionChoice> {
+  const title = reason
+    ? `Read blocked: "${filePath}" is in denyRead (${reason})`
+    : `Read blocked: "${filePath}" is not in allowRead`;
+  return showPermissionPrompt(ctx, title, PERMISSION_OPTIONS, signal, label);
+}
+
+// Write the full environment to a temporary shell file.
+//
+// Sandboxed process reaches environment through the filesystem instead of the
+// execve() argument buffer, which has a ~128 KiB cap.
+export function writeEnvFile(
+  env: NodeJS.ProcessEnv,
+  proxyPort: number | null,
+  proxyToken?: string,
+): { dir: string; path: string } {
+  const lines: string[] = [];
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) continue;
+    // bash exports non-identifier names (e.g. a `BASH_FUNC_foo%%` function
+    // export) that `export NAME=...` rejects; emitting one makes `source` exit
+    // non-zero and the `&&`-chained command never runs. Skip what the shell
+    // itself cannot set.
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    // Escape single quotes: ' -> '\''
+    const escaped = value.replace(/'/g, "'\\''");
+    lines.push(`export ${key}='${escaped}'`);
+  }
+  if (proxyPort !== null) {
+    const proxyVars = createProxyEnvironment(proxyPort, proxyToken);
+    for (const [name, value] of Object.entries(proxyVars)) {
+      lines.push(`export ${name}='${value}'`);
+    }
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'pi-landstrip-env-'));
+  const path = join(dir, 'env.sh');
+  writeFileSync(path, lines.join('\n'), 'utf-8');
+  return { dir, path };
+}
+
+export const POSIX_SHELL_PROVIDER_ID = 'posix';
+
+export function createPosixShellProvider(): LandstripShellProvider {
+  return {
+    id: POSIX_SHELL_PROVIDER_ID,
+    prepare(options: LandstripShellPrepareOptions): LandstripShellInvocation {
+      if (options.signal?.aborted) throw new Error('aborted');
+      const { shell, args } = getShellConfig(SettingsManager.create(options.cwd).getShellPath());
+      const envFile = writeEnvFile(options.env, null);
+      let disposed = false;
+
+      return {
+        executable: shell,
+        args: [...args, `source '${envFile.path}' && ${options.command}`],
+        launcherEnv: { PATH: process.env.PATH, HOME: process.env.HOME },
+        readPaths: [envFile.path],
+        dispose() {
+          if (disposed) return;
+          disposed = true;
+          rmSync(envFile.dir, { recursive: true, force: true });
+        },
+      };
+    },
+  };
+}
+
+function shellEnvironment(
+  env: NodeJS.ProcessEnv | undefined,
+  cwd: string,
+  proxyPort: number | null,
+  proxyToken?: string,
+): NodeJS.ProcessEnv {
+  const result: NodeJS.ProcessEnv = { ...process.env, ...env, PWD: resolve(cwd) };
+  return createProxyEnvironment(proxyPort, proxyToken, result);
+}
+
+export function createLandstripLauncherEnvironment(
+  providerEnv: NodeJS.ProcessEnv,
+  hostEnv: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): NodeJS.ProcessEnv {
+  if (platform !== 'win32' || hostEnv.ProgramData === undefined) return providerEnv;
+  return { ...providerEnv, ProgramData: hostEnv.ProgramData };
+}
+
+export function createWindowsDenyRead(denyRead: readonly string[], volumeRoot: string): string[] {
+  return [...new Set([...denyRead.filter((path) => !path.startsWith('/')), volumeRoot])];
+}
+
+/** Options for creating a landstrip sandbox integration. */
+export interface LandstripIntegrationOptions {
+  /** Register a sandboxed bash tool when the integration is registered. */
+  readonly registerBashTool?: boolean;
+  /** Working directory used when registering the default bash tool. */
+  readonly cwd?: string;
+}
+
+/** Filesystem access requested by a primary Pi file tool. */
+export interface FilesystemToolAccess {
+  readonly operation: 'read' | 'write';
+  readonly path: string;
+}
+
+/** Result of applying sandbox filesystem policy before a Pi file tool runs. */
+export interface FilesystemToolAuthorization {
+  readonly allowed: boolean;
+  readonly prompted: boolean;
+  readonly reason?: string;
+}
+
+export interface FilesystemToolAuthorizationOptions {
+  readonly signal?: AbortSignal;
+  readonly authorizationNote?: string;
+}
+
+/** Landstrip sandbox integration hooks for Pi. */
+export interface LandstripIntegration extends PiLandstripRuntimeV2 {
+  /** Resolve a permission ask through the registered external provider. */
+  resolvePermissionAsk(
+    request: LandstripPermissionAskRequest,
+  ): Promise<LandstripPermissionAskDecision>;
+  /** Prepare a full Pi RPC process constrained by the effective sandbox policy. */
+  prepareRpcWorker(options: LandstripRpcWorkerOptions): Promise<LandstripRpcWorkerLaunch>;
+  /** Apply sandbox filesystem rules before a primary Pi file tool runs. */
+  authorizeFilesystemToolAccess(
+    ctx: ExtensionContext,
+    accesses: readonly FilesystemToolAccess[],
+    options?: FilesystemToolAuthorizationOptions,
+  ): Promise<FilesystemToolAuthorization>;
+  /** Register the integration's tools, events, flags, and commands with Pi. */
+  register(pi: ExtensionAPI): void;
+  /** Return the active Pi extension context, when a session is running. */
+  getExtensionContext(): ExtensionContext | undefined;
+  /** Publish an integration lifecycle event from an embedded runtime. */
+  emit(event: LandstripEvent): void;
+  /** Callbacks for querying and toggling sandbox state. */
+  readonly sandboxCallbacks?: SandboxCallbacks;
+}
+
+/** Callbacks for editing sandbox state from the agents dashboard. */
+export interface SandboxCallbacks {
+  load(cwd: string, includeProject: boolean): { global: boolean; project?: boolean };
+  setEnabled(ctx: ExtensionContext, enabled: boolean, scope: SandboxConfigScope): Promise<void>;
+  clearProject(ctx: ExtensionContext): Promise<void>;
+  overview(cwd: string, includeProject: boolean): SandboxOverview;
+}
+
+/** Display data for the sandbox section of the settings pane. */
+export interface SandboxOverview {
+  readonly enabled: boolean;
+  readonly running: boolean;
+  readonly noSandboxFlag: boolean;
+  readonly networkMode: 'unrestricted' | 'blocked' | 'proxied';
+  readonly shellReadMode: 'host' | 'policy';
+  readonly readRuleScope: string;
+  readonly windowsMode?: string;
+  readonly changeScope: SandboxConfigScope;
+  readonly paths: { readonly global: string; readonly project: string; readonly binary: string };
+  readonly config: SandboxConfig;
+  readonly sessionDomains: readonly string[];
+  readonly sessionReadPaths: readonly string[];
+  readonly sessionWritePaths: readonly string[];
+}
+
+export interface LandstripRpcWorkerOptions extends LandstripProcessOptions {
+  readonly permissionPromptLabel?: string;
+  readonly env: NodeJS.ProcessEnv;
+  readonly readPaths: readonly string[];
+  readonly writePaths: readonly string[];
+  readonly protectedPaths?: readonly string[];
+  /** Domains the worker may reach through the filter proxy without prompting. */
+  readonly domains?: readonly string[];
+}
+
+export interface LandstripRpcWorkerLaunch extends LandstripPreparedProcess {
+  readonly spawn: RpcSpawn;
+}
+
+export type {
+  LandstripContextV2,
+  LandstripEvent,
+  LandstripPermissionAsk,
+  LandstripPermissionAskDecision,
+  LandstripPermissionAskProvider,
+  LandstripPermissionAskRequest,
+  LandstripPreparedProcess,
+  LandstripProcessOptions,
+  LandstripSandboxState,
+  LandstripShellInvocation,
+  LandstripShellPrepareOptions,
+  LandstripShellProvider,
+  LandstripWorkerExtension,
+  PiLandstripRuntimeV2,
+} from './api.ts';
+
+/** Register the landstrip extension with Pi. */
+export default function (pi: ExtensionAPI) {
+  const workerConfig = workerConfigFromEnvironment();
+  if (workerConfig) {
+    registerSubagentWorker(pi, workerConfig);
+    return;
+  }
+  const permissionPrompts = new PermissionPromptCoordinator();
+  const integration = createLandstripIntegrationWithPrompts({}, permissionPrompts);
+  registerSubagents(pi, integration, permissionPrompts);
+  integration.register(pi);
+}
+
+/** Create a landstrip integration for registration or custom embedding. */
+export function createLandstripIntegration(
+  options: LandstripIntegrationOptions = {},
+): LandstripIntegration {
+  return createLandstripIntegrationWithPrompts(options, new PermissionPromptCoordinator());
+}
+
+function createLandstripIntegrationWithPrompts(
+  options: LandstripIntegrationOptions,
+  permissionPrompts: PermissionPromptCoordinator,
+): LandstripIntegration {
+  const shouldRegisterBashTool = options.registerBashTool ?? true;
+  const localCwd = options.cwd ?? process.cwd();
+  let projectConfigTrusted = false;
+
+  function loadConfig(cwd: string): ReturnType<typeof loadSandboxConfig> {
+    return loadSandboxConfig(cwd, projectConfigTrusted);
+  }
+
+  let sandboxEnabled = false;
+  let sandboxReady = false;
+  let sandboxState: LandstripSandboxState = 'unavailable';
+  let unsandboxedWorkerWarningShown = false;
+  let activeContext: ExtensionContext | undefined;
+  let unpublishRuntime: (() => void) | undefined;
+  const defaultShellProvider = createPosixShellProvider();
+  let externalShellProvider: LandstripShellProvider | undefined;
+  let externalPermissionAskProvider: LandstripPermissionAskProvider | undefined;
+  const eventHandlers = new Set<(event: LandstripEvent) => void>();
+  const workerExtensions = new Map<string, { entry: string; registrations: number }>();
+  const sessionAllowedDomains: string[] = [];
+  const sessionAllowedReadPaths: string[] = [];
+  const sessionAllowedWritePaths: string[] = [];
+  const sessionAllowedTargets: string[] = [];
+
+  function getContext(ctx = activeContext): LandstripContextV2 {
+    return {
+      version: LANDSTRIP_RUNTIME_VERSION,
+      host: 'pi',
+      role: 'primary',
+      sandbox: sandboxState,
+      cwd: ctx?.cwd ?? localCwd,
+      sessionId: ctx?.sessionManager?.getSessionId(),
+      depth: 0,
+    };
+  }
+
+  function emitEvent(event: LandstripEvent): void {
+    for (const handler of eventHandlers) {
+      try {
+        handler(event);
+      } catch (error) {
+        console.error(`pi-landstrip: lifecycle listener failed: ${formatError(error)}`);
+      }
+    }
+  }
+
+  function setSandboxState(state: LandstripSandboxState, ctx: ExtensionContext): void {
+    if (sandboxState === state) return;
+    sandboxState = state;
+    emitEvent({ type: 'sandbox.changed', context: getContext(ctx) });
+  }
+
+  function on<T extends LandstripEvent['type']>(
+    type: T,
+    handler: (event: Extract<LandstripEvent, { type: T }>) => void,
+  ): () => void {
+    const listener = (event: LandstripEvent): void => {
+      if (event.type === type) handler(event as Extract<LandstripEvent, { type: T }>);
+    };
+    eventHandlers.add(listener);
+    return () => eventHandlers.delete(listener);
+  }
+
+  function registerShellProvider(provider: LandstripShellProvider): () => void {
+    const id = provider.id.trim();
+    if (!id) throw new Error('Shell provider id must not be empty');
+    if (id === POSIX_SHELL_PROVIDER_ID) {
+      throw new Error(`Shell provider id "${POSIX_SHELL_PROVIDER_ID}" is reserved`);
+    }
+    if (externalShellProvider) {
+      throw new Error(
+        `Shell provider "${externalShellProvider.id}" is already registered; cannot register "${id}"`,
+      );
+    }
+
+    externalShellProvider = provider;
+    let disposed = false;
+    return () => {
+      if (disposed) return;
+      disposed = true;
+      if (externalShellProvider === provider) externalShellProvider = undefined;
+    };
+  }
+
+  function registerPermissionAskProvider(provider: LandstripPermissionAskProvider): () => void {
+    const id = provider.id.trim();
+    if (!id) throw new Error('Permission ask provider id must not be empty');
+    if (externalPermissionAskProvider) {
+      throw new Error(
+        `Permission ask provider "${externalPermissionAskProvider.id}" is already registered; cannot register "${id}"`,
+      );
+    }
+
+    externalPermissionAskProvider = provider;
+    let disposed = false;
+    return () => {
+      if (disposed) return;
+      disposed = true;
+      if (externalPermissionAskProvider === provider) externalPermissionAskProvider = undefined;
+    };
+  }
+
+  async function resolvePermissionAsk(
+    request: LandstripPermissionAskRequest,
+  ): Promise<LandstripPermissionAskDecision> {
+    const provider = externalPermissionAskProvider;
+    if (!provider) return { decision: 'abstain' };
+
+    const result: unknown = await provider.decide(request);
+    if (
+      typeof result !== 'object' ||
+      result === null ||
+      !('decision' in result) ||
+      !['allow', 'deny', 'abstain'].includes(String(result.decision)) ||
+      ('reason' in result && result.reason !== undefined && typeof result.reason !== 'string')
+    ) {
+      throw new Error(`Permission ask provider "${provider.id}" returned an invalid decision`);
+    }
+    return result as LandstripPermissionAskDecision;
+  }
+
+  function activeShellProvider(): LandstripShellProvider {
+    return externalShellProvider ?? defaultShellProvider;
+  }
+
+  function registerWorkerExtension(extension: LandstripWorkerExtension): () => void {
+    const id = extension.id.trim();
+    if (!id) throw new Error('Worker extension id must not be empty');
+    const requestedEntry = extension.entry.startsWith('file:')
+      ? fileURLToPath(extension.entry)
+      : extension.entry;
+    if (!isAbsolute(requestedEntry)) {
+      throw new Error('Worker extension entry must be an absolute path or file URL');
+    }
+    if (!existsSync(requestedEntry)) {
+      throw new Error(`Worker extension entry does not exist: ${requestedEntry}`);
+    }
+    const entry = realpathSync(requestedEntry);
+
+    const existing = workerExtensions.get(id);
+    if (existing && existing.entry !== entry) {
+      throw new Error(`Worker extension id is already registered with another entry: ${id}`);
+    }
+    if (existing) existing.registrations += 1;
+    else workerExtensions.set(id, { entry, registrations: 1 });
+
+    let disposed = false;
+    return () => {
+      if (disposed) return;
+      disposed = true;
+      const registration = workerExtensions.get(id);
+      if (!registration || registration.entry !== entry) return;
+      registration.registrations -= 1;
+      if (registration.registrations === 0) workerExtensions.delete(id);
+    };
+  }
+
+  function getWorkerExtensions(): readonly LandstripWorkerExtension[] {
+    return [...workerExtensions].map(([id, extension]) => ({ id, entry: extension.entry }));
+  }
+
+  function getEffectiveAllowRead(
+    config: SandboxConfig,
+    cwd: string,
+    allowances?: ExecutionAllowances,
+  ): string[] {
+    const paths = mergeAllowances(
+      config.filesystem.allowRead,
+      sessionAllowedReadPaths,
+      allowances?.readPaths,
+    );
+    if (process.platform !== 'win32') return paths;
+
+    return paths.filter(
+      (path) => !path.startsWith('/') && (path.includes('*') || existsSync(expandPath(path, cwd))),
+    );
+  }
+
+  function getEffectiveAllowWrite(
+    config: SandboxConfig,
+    allowances?: ExecutionAllowances,
+  ): string[] {
+    const paths = mergeAllowances(
+      config.filesystem.allowWrite,
+      sessionAllowedWritePaths,
+      allowances?.writePaths,
+    );
+    return process.platform === 'win32' ? paths.filter((path) => !path.startsWith('/')) : paths;
+  }
+
+  function getEffectiveDenyRead(config: SandboxConfig, cwd: string): string[] {
+    if (process.platform !== 'win32') return config.filesystem.denyRead;
+
+    // Windows sandbox ACLs propagate to existing descendants, so make read policy
+    // an explicit allowlist instead of scanning and granting a volume tree. Ignore
+    // POSIX-only absolute paths because no corresponding ACL target exists.
+    const volumeRoot = parse(resolve(cwd)).root;
+    return createWindowsDenyRead(config.filesystem.denyRead, volumeRoot);
+  }
+
+  function hasBaselineWindowsApplicationAccess(filePath: string): boolean {
+    const normalizedPath = normalizePathSeparators(resolve(filePath)).toLowerCase();
+    const systemRoots = [
+      process.env.ProgramFiles,
+      process.env['ProgramFiles(x86)'],
+      process.env.ProgramW6432,
+      process.env.SystemRoot,
+    ];
+
+    return systemRoots.some((root) => {
+      if (!root) return false;
+      return pathUnderDirectory(
+        normalizedPath,
+        normalizePathSeparators(resolve(root)).toLowerCase(),
+      );
+    });
+  }
+
+  function withWindowsProcessReadAccess(
+    allowances: ExecutionAllowances,
+    command: string,
+    cwd: string,
+    additionalPaths: string[] = [],
+  ): ExecutionAllowances {
+    if (process.platform !== 'win32') return allowances;
+
+    const executable = resolve(cwd, command);
+    // Both standard AppContainers and restricted-user tokens receive baseline
+    // read/execute access to Windows and Program Files through ALL APPLICATION
+    // PACKAGES. Adding a sandbox-specific ACE there requires elevated WRITE_DAC.
+    const executablePaths = hasBaselineWindowsApplicationAccess(executable) ? [] : [executable];
+    return {
+      ...allowances,
+      readPaths: [...new Set([...allowances.readPaths, ...executablePaths, ...additionalPaths])],
+    };
+  }
+
+  async function applyDomainChoice(
+    choice: Exclude<PermissionChoice, 'abort'>,
+    domain: string,
+    cwd: string,
+    allowances?: ExecutionAllowances,
+  ): Promise<void> {
+    const { globalPath, projectPath } = getPiConfigPaths(cwd, 'sandbox.json');
+    const configPath =
+      choice === 'project' ? projectPath : choice === 'global' ? globalPath : undefined;
+    if (configPath) {
+      await addConfigValue(
+        configPath,
+        domain,
+        (config) => config.network?.allowedDomains ?? [],
+        (config, allowedDomains) => {
+          config.network = {
+            ...config.network,
+            allowedDomains,
+            deniedDomains: config.network?.deniedDomains ?? [],
+          };
+        },
+      );
+    }
+    const target = choice === 'once' ? allowances?.domains : sessionAllowedDomains;
+    if (target && !target.includes(domain)) target.push(domain);
+  }
+
+  // Breadth-first: approve the broadest reasonable ancestor of the blocked file
+  // (see sessionScopeFor) instead of the exact path, so the still-running
+  // command stops prompting for sibling files under the same tree. When the
+  // scope widens beyond the file, tell the user what was actually granted.
+  function noteScope(
+    ctx: ExtensionContext,
+    verb: string,
+    choice: Exclude<PermissionChoice, 'abort'>,
+    filePath: string,
+    scope: string,
+  ): void {
+    if (scope !== filePath) notify(ctx, `${verb} allowed (${choice}): ${scope}`, 'info');
+  }
+
+  async function applyReadChoice(
+    ctx: ExtensionContext,
+    choice: Exclude<PermissionChoice, 'abort'>,
+    filePath: string,
+    cwd: string,
+    allowances?: ExecutionAllowances,
+  ): Promise<void> {
+    const { globalPath, projectPath } = getPiConfigPaths(cwd, 'sandbox.json');
+    const scope = sessionScopeFor(filePath, cwd);
+    const configPath =
+      choice === 'project' ? projectPath : choice === 'global' ? globalPath : undefined;
+    if (configPath) {
+      await addConfigValue(
+        configPath,
+        scope,
+        (config) => config.filesystem?.allowRead ?? [],
+        (config, allowRead) => {
+          config.filesystem = { ...config.filesystem, allowRead };
+        },
+      );
+    }
+    const target = choice === 'once' ? allowances?.readPaths : sessionAllowedReadPaths;
+    if (target && !target.includes(scope)) target.push(scope);
+    noteScope(ctx, 'Read', choice, filePath, scope);
+  }
+
+  async function applyWriteChoice(
+    ctx: ExtensionContext,
+    choice: Exclude<PermissionChoice, 'abort'>,
+    filePath: string,
+    cwd: string,
+    allowances?: ExecutionAllowances,
+  ): Promise<void> {
+    const { globalPath, projectPath } = getPiConfigPaths(cwd, 'sandbox.json');
+    const scope = sessionScopeFor(filePath, cwd);
+    const configPath =
+      choice === 'project' ? projectPath : choice === 'global' ? globalPath : undefined;
+    if (configPath) {
+      await addConfigValue(
+        configPath,
+        scope,
+        (config) => config.filesystem?.allowWrite ?? [],
+        (config, allowWrite) => {
+          config.filesystem = { ...config.filesystem, allowWrite };
+        },
+      );
+    }
+    const target = choice === 'once' ? allowances?.writePaths : sessionAllowedWritePaths;
+    if (target && !target.includes(scope)) target.push(scope);
+    noteScope(ctx, 'Write', choice, filePath, scope);
+  }
+
+  async function authorizeFilesystemToolAccess(
+    ctx: ExtensionContext,
+    accesses: readonly FilesystemToolAccess[],
+    options: FilesystemToolAuthorizationOptions = {},
+  ): Promise<FilesystemToolAuthorization> {
+    const normalized = [
+      ...new Map(
+        accesses.map((access) => {
+          const path = normalizeBlockedPath(access.path, ctx.cwd);
+          return [`${access.operation}\u0000${path}`, { ...access, path }] as const;
+        }),
+      ).values(),
+    ];
+
+    const current = (): FilesystemToolAuthorization | undefined => {
+      const config = loadConfig(ctx.cwd);
+      for (const access of normalized) {
+        if (
+          matchesPattern(
+            access.path,
+            access.operation === 'read'
+              ? config.filesystem.denyReadAlways
+              : mergeArray(config.filesystem.denyWriteAlways, config.filesystem.denyWrite),
+            ctx.cwd,
+          )
+        ) {
+          return {
+            allowed: false,
+            prompted: false,
+            reason: `${access.operation === 'read' ? 'Read' : 'Write'} denied by sandbox policy: ${access.path}`,
+          };
+        }
+      }
+
+      const blocked = normalized.filter((access) =>
+        access.operation === 'read'
+          ? !readAllowed(
+              access.path,
+              getEffectiveAllowRead(config, ctx.cwd),
+              getEffectiveDenyRead(config, ctx.cwd),
+              ctx.cwd,
+            )
+          : shouldPromptForWrite(access.path, getEffectiveAllowWrite(config), ctx.cwd),
+      );
+      return blocked.length === 0 ? { allowed: true, prompted: false } : undefined;
+    };
+
+    const existing = current();
+    if (existing) return existing;
+    if (!ctx.hasUI) {
+      return { allowed: false, prompted: false, reason: 'Filesystem access requires approval' };
+    }
+
+    return permissionPrompts.resolve(
+      current,
+      async (promptSignal) => {
+        const config = loadConfig(ctx.cwd);
+        const blocked = normalized.filter((access) =>
+          access.operation === 'read'
+            ? !readAllowed(
+                access.path,
+                getEffectiveAllowRead(config, ctx.cwd),
+                getEffectiveDenyRead(config, ctx.cwd),
+                ctx.cwd,
+              )
+            : shouldPromptForWrite(access.path, getEffectiveAllowWrite(config), ctx.cwd),
+        );
+        const paths = blocked.map(({ operation, path }) => `${operation}: ${path}`).join('\n');
+        const note = options.authorizationNote ? `\n\n${options.authorizationNote}` : '';
+        const choice = await showPermissionPrompt(
+          ctx,
+          `Filesystem policy blocked this tool call:\n${paths}${note}`,
+          PERMISSION_OPTIONS,
+          promptSignal,
+        );
+        if (choice === 'abort' || promptSignal.aborted) {
+          return { allowed: false, prompted: true, reason: 'Filesystem access denied' };
+        }
+        for (const access of blocked) {
+          if (access.operation === 'read') {
+            await applyReadChoice(ctx, choice, access.path, ctx.cwd);
+          } else {
+            await applyWriteChoice(ctx, choice, access.path, ctx.cwd);
+          }
+        }
+        return { allowed: true, prompted: true };
+      },
+      options.signal,
+    );
+  }
+
+  async function ensureDomainAllowed(
+    ctx: ExtensionContext,
+    domain: string,
+    cwd: string,
+    allowances?: ExecutionAllowances,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    const current = (): boolean | undefined => {
+      const config = loadConfig(cwd);
+      const decision = evaluateDomainAccess(domain, config.network, [
+        ...sessionAllowedDomains,
+        ...(allowances?.domains ?? []),
+      ]);
+      if (decision === 'deny') return false;
+      if (decision === 'allow') return true;
+      return undefined;
+    };
+    if (!ctx.hasUI) return current() ?? false;
+
+    return permissionPrompts.resolve(
+      current,
+      async (promptSignal) => {
+        const choice = await showPermissionPrompt(
+          ctx,
+          `Network blocked: "${domain}" is not in the allowed domains list`,
+          PERMISSION_OPTIONS,
+          promptSignal,
+          allowances?.permissionPromptLabel,
+        );
+        if (choice === 'abort' || promptSignal.aborted) return false;
+        await applyDomainChoice(choice, domain, cwd, allowances);
+        return true;
+      },
+      signal,
+    );
+  }
+
+  function buildLandstripPolicy(
+    cwd: string,
+    proxyPort: number | null,
+    audience: PolicyAudience,
+    allowances?: ExecutionAllowances,
+  ): LandstripPolicy {
+    const config = loadConfig(cwd);
+    const readPolicy = resolveProcessReadPolicy(
+      audience,
+      config.shell.readAccess,
+      mergeArray(getEffectiveDenyRead(config, cwd), [
+        ...(allowances?.explicitDenyRead?.patterns ?? []),
+        ...[...(allowances?.explicitDenyRead?.globRoots.values() ?? [])].flat(),
+      ]),
+      getEffectiveAllowRead(config, cwd, allowances),
+    );
+
+    return assembleLandstripPolicy({
+      network: config.network,
+      filesystem: {
+        ...readPolicy,
+        denyReadAlways: mergeArray(config.filesystem.denyReadAlways, allowances?.protectedPaths),
+        allowWrite: getEffectiveAllowWrite(config, allowances),
+        denyWrite: mergeArray(config.filesystem.denyWrite, allowances?.protectedPaths),
+        denyWriteAlways: mergeArray(config.filesystem.denyWriteAlways, allowances?.protectedPaths),
+      },
+      windows: config.windows,
+      httpProxyPort: proxyPort,
+    });
+  }
+
+  function writePolicyFile(
+    cwd: string,
+    proxyPort: number | null,
+    audience: PolicyAudience,
+    allowances?: ExecutionAllowances,
+  ): { dir: string; path: string } {
+    const dir = mkdtempSync(join(tmpdir(), 'pi-landstrip-'));
+    const path = join(dir, 'policy.json');
+    writeFileSync(
+      path,
+      serializeLandstripPolicy(buildLandstripPolicy(cwd, proxyPort, audience, allowances)),
+      'utf-8',
+    );
+    return { dir, path };
+  }
+
+  function startProxy(
+    ctx: ExtensionContext,
+    cwd: string,
+    allowances: ExecutionAllowances,
+    signal?: AbortSignal,
+    authorization?: string,
+    portRange?: ProxyPortRange,
+  ): Promise<{ port: number; stop: () => Promise<void> }> {
+    return startFilterProxy({
+      isDomainAllowed: async (domain) => {
+        const config = loadConfig(cwd);
+        if (domainMatchesAny(domain, config.network.deniedDomains)) return false;
+        return ensureDomainAllowed(ctx, domain, cwd, allowances, signal);
+      },
+      authorization,
+      portRange,
+    });
+  }
+
+  function createSocketPair(): Promise<[NetSocket, NetSocket]> {
+    return new Promise((resolve, reject) => {
+      const server = createServer();
+      server.on('error', reject);
+      let client: NetSocket | null = null;
+      server.on('connection', (serverEnd) => {
+        server.removeListener('error', reject);
+        server.close();
+        if (client) {
+          client.removeListener('error', reject);
+          resolve([client, serverEnd]);
+        }
+      });
+      server.listen(0, '127.0.0.1', () => {
+        const addr = server.address() as AddressInfo;
+        client = new NetSocket();
+        client.on('error', reject);
+        client.connect(addr.port, '127.0.0.1');
+      });
+    });
+  }
+
+  interface TrapQueryResult {
+    action: LandstripControlResponse['action'];
+    reason?: 'unprompted' | 'rejected' | 'hard-deny';
+  }
+
+  async function resolveTrapQuery(
+    trap: LandstripFilesystemTrap | LandstripNetworkTrap,
+    ctx: ExtensionContext,
+    cwd: string,
+    allowances: ExecutionAllowances,
+    promptOnBlock: boolean,
+    signal?: AbortSignal,
+  ): Promise<TrapQueryResult> {
+    // The broker knows only address:port, and no sandbox field can express a grant
+    // for one non-loopback endpoint: allowedDomains is enforced by the proxy,
+    // allowLocalBinding grants all loopback endpoints, and allowNetwork disables
+    // network enforcement. So a non-loopback connection is granted for the session
+    // or not at all.
+    if (!isFilesystemTrap(trap)) {
+      const key = `${trap.operation}\u0000${trap.target}`;
+      const current = (): TrapQueryResult | undefined =>
+        sessionAllowedTargets.includes(key) || allowances.targets.includes(key)
+          ? { action: 'allow' }
+          : undefined;
+      const existing = current();
+      if (existing) return existing;
+      if (!ctx.hasUI || !promptOnBlock) return { action: 'deny', reason: 'unprompted' };
+
+      return permissionPrompts.resolve(
+        current,
+        async (promptSignal) => {
+          const choice = await showPermissionPrompt(
+            ctx,
+            `Network blocked: ${trap.operation} "${trap.target}"`,
+            NETWORK_PERMISSION_OPTIONS,
+            promptSignal,
+            allowances.permissionPromptLabel,
+          );
+          if (choice === 'abort' || promptSignal.aborted)
+            return { action: 'deny', reason: 'rejected' };
+          const targets = choice === 'once' ? allowances.targets : sessionAllowedTargets;
+          if (!targets.includes(key)) targets.push(key);
+          return { action: 'allow' };
+        },
+        signal,
+      );
+    }
+
+    const path = normalizeBlockedPath(trap.path, cwd);
+    const current = (): TrapQueryResult | undefined => {
+      if (matchesPattern(path, allowances.protectedPaths ?? [], cwd)) {
+        return { action: 'deny', reason: 'hard-deny' };
+      }
+      const config = loadConfig(cwd);
+      if (
+        trap.operation === 'read' &&
+        matchesPattern(path, config.filesystem.denyReadAlways, cwd)
+      ) {
+        return { action: 'deny', reason: 'hard-deny' };
+      }
+      if (
+        trap.operation === 'read' &&
+        allowances.explicitDenyRead &&
+        matchesPattern(
+          path,
+          mergeArray(allowances.explicitDenyRead.patterns, config.explicitDenyRead),
+          cwd,
+          allowances.explicitDenyRead.globRoots,
+        )
+      ) {
+        return { action: 'deny', reason: 'hard-deny' };
+      }
+      if (
+        trap.operation === 'write' &&
+        (matchesPattern(path, config.filesystem.denyWriteAlways, cwd) ||
+          matchesPattern(path, config.filesystem.denyWrite, cwd))
+      ) {
+        return { action: 'deny', reason: 'hard-deny' };
+      }
+      const allowed =
+        trap.operation === 'read'
+          ? readAllowed(
+              path,
+              getEffectiveAllowRead(config, cwd, allowances),
+              getEffectiveDenyRead(config, cwd),
+              cwd,
+            )
+          : !shouldPromptForWrite(path, getEffectiveAllowWrite(config, allowances), cwd);
+      return allowed ? { action: 'allow' } : undefined;
+    };
+    const existing = current();
+    if (existing) return existing;
+    if (!ctx.hasUI || !promptOnBlock) return { action: 'deny', reason: 'unprompted' };
+
+    return permissionPrompts.resolve(
+      current,
+      async (promptSignal) => {
+        const config = loadConfig(cwd);
+        const choice =
+          trap.operation === 'read'
+            ? await promptReadBlock(
+                ctx,
+                path,
+                matchesPattern(path, config.filesystem.denyRead, cwd)
+                  ? 'granting allowRead will override it'
+                  : undefined,
+                promptSignal,
+                allowances.permissionPromptLabel,
+              )
+            : await showPermissionPrompt(
+                ctx,
+                `Write blocked: "${path}" is not in allowWrite`,
+                PERMISSION_OPTIONS,
+                promptSignal,
+                allowances.permissionPromptLabel,
+              );
+        if (choice === 'abort' || promptSignal.aborted)
+          return { action: 'deny', reason: 'rejected' };
+        if (trap.operation === 'read') {
+          await applyReadChoice(ctx, choice, path, cwd, allowances);
+        } else {
+          await applyWriteChoice(ctx, choice, path, cwd, allowances);
+        }
+        return { action: 'allow' };
+      },
+      signal,
+    );
+  }
+
+  function attachWorkerTrap(
+    socket: NetSocket,
+    ctx: ExtensionContext,
+    cwd: string,
+    allowances: ExecutionAllowances,
+    signal?: AbortSignal,
+  ): void {
+    const decoder = new StringDecoder('utf8');
+    let buffer = '';
+    let prompts = Promise.resolve();
+    const reportTrapError = (message: string): void => {
+      notify(ctx, message, 'error');
+      if (!ctx.hasUI) console.error(`pi-landstrip: ${message}`);
+    };
+    const respond = (queryId: string, action: LandstripControlResponse['action']): void => {
+      if (socket.destroyed) return;
+      socket.write(controlResponseLine(queryId, action), (error) => {
+        if (error) reportTrapError(`Worker sandbox control response failed: ${error.message}`);
+      });
+    };
+
+    const handleQuery = (trap: LandstripFilesystemTrap | LandstripNetworkTrap): void => {
+      prompts = prompts
+        .then(async () => {
+          const result = await resolveTrapQuery(trap, ctx, cwd, allowances, true, signal);
+          respond(trap.query_id, result.action);
+        })
+        .catch(() => respond(trap.query_id, 'deny'));
+    };
+
+    socket.on('error', (error) => {
+      reportTrapError(`Worker sandbox control failed: ${error.message}`);
+    });
+
+    socket.on('data', (data: Buffer) => {
+      buffer += decoder.write(data);
+      let newline = buffer.indexOf('\n');
+      while (newline >= 0) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        newline = buffer.indexOf('\n');
+        const trap = parseTrapLine(line);
+        if (!trap) continue;
+        if (!isQueryTrap(trap)) {
+          reportTrapError(`Worker sandbox reported: ${formatLandstripTraps([trap])}`);
+          continue;
+        }
+        handleQuery(trap);
+      }
+    });
+  }
+
+  function prepareUnsandboxedRpcWorker(
+    options: LandstripRpcWorkerOptions,
+  ): LandstripRpcWorkerLaunch {
+    let spawned = false;
+    let disposed = false;
+    let disposePromise: Promise<void> | undefined;
+    let preparedChild: ChildProcess | undefined;
+    const spawnWorker: RpcSpawn = (command, args, spawnOptions) => {
+      if (disposed) throw new Error('Prepared process has been disposed');
+      if (spawned) throw new Error('Prepared process can only be spawned once');
+      spawned = true;
+      const child = spawn(command, [...args], {
+        ...spawnOptions,
+        cwd: options.cwd,
+        env: options.env,
+        detached: true,
+      });
+      patchProcessGroupKill(child);
+      preparedChild = child;
+      return child as ReturnType<RpcSpawn>;
+    };
+
+    return {
+      command: options.command,
+      args: options.args,
+      cwd: options.cwd,
+      env: options.env,
+      spawn: spawnWorker,
+      dispose() {
+        disposePromise ??= (async () => {
+          disposed = true;
+          await stopPreparedChild(preparedChild);
+        })();
+        return disposePromise;
+      },
+    };
+  }
+
+  async function prepareRpcWorker(
+    options: LandstripRpcWorkerOptions,
+  ): Promise<LandstripRpcWorkerLaunch> {
+    if (options.signal?.aborted) throw new Error('Task cancelled');
+    if (!ensureSandboxState(options.ctx)) {
+      if (sandboxState === 'unavailable') {
+        throw new Error('Sandbox is unavailable; refusing subagent process');
+      }
+      if (!unsandboxedWorkerWarningShown) {
+        warnUnsandboxed(
+          options.ctx,
+          'Subagent processes are running without Landstrip sandboxing',
+          'warning',
+        );
+        unsandboxedWorkerWarningShown = true;
+      }
+      return prepareUnsandboxedRpcWorker(options);
+    }
+    const allowances: ExecutionAllowances = {
+      permissionPromptLabel: options.permissionPromptLabel,
+      domains: [...(options.domains ?? [])],
+      readPaths: [...options.readPaths],
+      writePaths: [...options.writePaths],
+      targets: [],
+      protectedPaths: [
+        ...new Set(
+          (options.protectedPaths ?? []).flatMap((path) => {
+            if (/[*?[\]]/.test(path)) {
+              throw new Error(
+                `Worker protected path "${path}" must be a concrete path, not a glob`,
+              );
+            }
+            return [expandPath(path, options.cwd), canonicalizePath(path, options.cwd)];
+          }),
+        ),
+      ],
+    };
+    const processAllowances = withWindowsProcessReadAccess(
+      allowances,
+      options.command,
+      options.cwd,
+    );
+    const config = loadConfig(options.cwd);
+    const explicitDenyGlobRoots = new Map<string, string[]>();
+    processAllowances.explicitDenyRead = {
+      patterns: config.explicitDenyRead,
+      globRoots: explicitDenyGlobRoots,
+    };
+    for (const path of [options.cwd, options.command, ...processAllowances.readPaths]) {
+      if (/[*?[\]]/.test(path)) {
+        throw new Error(`Worker startup read path "${path}" must be a concrete path, not a glob`);
+      }
+      const deny = config.explicitDenyRead.find((pattern) =>
+        matchesPattern(path, [pattern], options.cwd, explicitDenyGlobRoots),
+      );
+      if (deny !== undefined) {
+        throw new Error(
+          `Worker startup read path "${path}" conflicts with explicit filesystem.denyRead "${deny}"; change the configured deny or the worker startup paths`,
+        );
+      }
+    }
+    const { token: proxyToken, authorization: proxyAuthorization } = createProxyCredentials();
+    const proxy = shouldStartProxy(config)
+      ? await startProxy(
+          options.ctx,
+          options.cwd,
+          processAllowances,
+          options.signal,
+          proxyAuthorization,
+          restrictedUserProxyPortRange(),
+        )
+      : null;
+    let policy: ReturnType<typeof writePolicyFile> | undefined;
+    let trapSocket: NetSocket | undefined;
+    let childEnd: NetSocket | undefined;
+    let disposed = false;
+    try {
+      if (options.signal?.aborted) throw new Error('Task cancelled');
+      policy = writePolicyFile(options.cwd, proxy?.port ?? null, 'worker', processAllowances);
+      if (process.platform !== 'win32') {
+        [trapSocket, childEnd] = await createSocketPair();
+        if (options.signal?.aborted) throw new Error('Task cancelled');
+        attachWorkerTrap(trapSocket, options.ctx, options.cwd, processAllowances, options.signal);
+      }
+    } catch (error) {
+      trapSocket?.destroy();
+      childEnd?.destroy();
+      if (policy) rmSync(policy.dir, { recursive: true, force: true });
+      await proxy?.stop();
+      throw error;
+    }
+
+    const workerPolicy = policy;
+    const workerTrapSocket = trapSocket;
+    const workerChildEnd = childEnd;
+    const workerEnv = createProxyEnvironment(proxy?.port ?? null, proxyToken, options.env ?? {});
+    let spawned = false;
+    let disposePromise: Promise<void> | undefined;
+    let preparedChild: ChildProcess | undefined;
+    const spawnWorker: RpcSpawn = (_command, _args, spawnOptions) => {
+      if (disposed) throw new Error('Prepared process has been disposed');
+      if (spawned) throw new Error('Prepared process can only be spawned once');
+      spawned = true;
+      const landstripArgs = [
+        'run',
+        '-p',
+        workerPolicy.path,
+        '--',
+        options.command,
+        ...options.args,
+      ];
+      const authPipe =
+        Array.isArray(spawnOptions.stdio) && spawnOptions.stdio[WORKER_AUTH_FD] === 'pipe';
+      if (authPipe && process.platform === 'win32') {
+        throw new Error('Sandboxed worker authentication requires inherited Unix file descriptors');
+      }
+      const stdio: StdioOptions = ['pipe', 'pipe', 'pipe'];
+      if (workerChildEnd || authPipe) stdio.push(workerChildEnd ?? 'ignore');
+      if (authPipe) {
+        stdio.push('pipe');
+        landstripArgs.splice(1, 0, '--inherit', String(WORKER_AUTH_FD));
+      }
+      if (workerChildEnd) landstripArgs.splice(1, 0, '--trap', '3');
+      const child = spawn(binaryPath(), landstripArgs, {
+        ...spawnOptions,
+        cwd: options.cwd,
+        env: workerEnv,
+        detached: true,
+        stdio,
+      });
+      workerChildEnd?.destroy();
+      patchProcessGroupKill(child);
+      preparedChild = child;
+      return child as ReturnType<RpcSpawn>;
+    };
+
+    return {
+      command: options.command,
+      args: options.args,
+      cwd: options.cwd,
+      env: workerEnv,
+      spawn: spawnWorker,
+      dispose() {
+        disposePromise ??= (async () => {
+          disposed = true;
+          await stopPreparedChild(preparedChild);
+          workerTrapSocket?.destroy();
+          workerChildEnd?.destroy();
+          rmSync(workerPolicy.dir, { recursive: true, force: true });
+          await proxy?.stop();
+        })();
+        return disposePromise;
+      },
+    };
+  }
+
+  async function prepareProcess(
+    options: LandstripProcessOptions,
+  ): Promise<LandstripPreparedProcess> {
+    if (process.platform === 'win32' && (getNoSandboxFlag() || !loadConfig(options.cwd).enabled)) {
+      throw new Error('Generic process preparation requires sandboxing on Windows');
+    }
+    return prepareRpcWorker({
+      ...options,
+      env: options.env ?? process.env,
+      readPaths: options.readPaths ?? [],
+      writePaths: options.writePaths ?? [],
+    });
+  }
+
+  function createProviderBashOps(): BashOperations {
+    return {
+      async exec(command, cwd, { onData, signal, timeout, env }) {
+        if (!existsSync(cwd)) throw new Error(`Working directory does not exist: ${cwd}`);
+
+        const provider = activeShellProvider();
+        let invocation: LandstripShellInvocation | undefined;
+        try {
+          invocation = await provider.prepare({
+            command,
+            cwd,
+            env: shellEnvironment(env, cwd, null),
+            signal,
+          });
+          if (!invocation.executable.trim()) {
+            throw new Error(`Shell provider "${provider.id}" returned an empty executable`);
+          }
+          if (signal?.aborted) throw new Error('aborted');
+          const prepared = invocation;
+
+          return await new Promise<{ exitCode: number | null }>((resolvePromise, reject) => {
+            let timeoutHandle: NodeJS.Timeout | undefined;
+            let timedOut = false;
+            let settled = false;
+            let childExited = false;
+            let childExitCode: number | null = null;
+            let postExitTimer: NodeJS.Timeout | undefined;
+            let stdoutEnded = false;
+            let stderrEnded = false;
+
+            const child = spawn(prepared.executable, prepared.args, {
+              cwd,
+              env: createLandstripLauncherEnvironment(prepared.launcherEnv),
+              detached: true,
+              stdio: ['ignore', 'pipe', 'pipe'],
+            });
+            patchProcessGroupKill(child);
+
+            const cleanup = async (): Promise<void> => {
+              if (timeoutHandle) clearTimeout(timeoutHandle);
+              if (postExitTimer) clearTimeout(postExitTimer);
+              signal?.removeEventListener('abort', onAbort);
+              const toDispose = invocation;
+              invocation = undefined;
+              await toDispose?.dispose?.();
+            };
+            const finish = (code: number | null): void => {
+              if (settled) return;
+              settled = true;
+              child.stdout?.destroy();
+              child.stderr?.destroy();
+              void cleanup().then(() => {
+                if (signal?.aborted) reject(new Error('aborted'));
+                else if (timedOut) reject(new Error(`timeout:${timeout}`));
+                else resolvePromise({ exitCode: code });
+              }, reject);
+            };
+            const maybeFinishAfterExit = (): void => {
+              if (childExited && stdoutEnded && stderrEnded) finish(childExitCode);
+            };
+            const killChild = (): void => {
+              child.kill('SIGKILL');
+            };
+            function onAbort(): void {
+              killChild();
+            }
+
+            child.stdout?.on('data', onData);
+            child.stderr?.on('data', onData);
+            child.stdout?.once('end', () => {
+              stdoutEnded = true;
+              maybeFinishAfterExit();
+            });
+            child.stderr?.once('end', () => {
+              stderrEnded = true;
+              maybeFinishAfterExit();
+            });
+            child.once('error', (error) => {
+              if (settled) return;
+              settled = true;
+              void cleanup().then(() => reject(error), reject);
+            });
+            child.once('exit', (code) => {
+              childExited = true;
+              childExitCode = code;
+              maybeFinishAfterExit();
+              if (!settled) postExitTimer = setTimeout(() => finish(code), EXIT_STDIO_GRACE_MS);
+            });
+            child.once('close', (code) => finish(code));
+
+            if (timeout !== undefined && timeout > 0) {
+              timeoutHandle = setTimeout(() => {
+                timedOut = true;
+                killChild();
+              }, timeout * 1000);
+            }
+            signal?.addEventListener('abort', onAbort, { once: true });
+            if (signal?.aborted) onAbort();
+          });
+        } catch (error) {
+          await invocation?.dispose?.();
+          throw error;
+        }
+      },
+    };
+  }
+  function createLandstripBashOps(
+    ctx: ExtensionContext,
+    callbacks: LandstripBashCallbacks = {},
+    allowances: ExecutionAllowances = { domains: [], readPaths: [], writePaths: [], targets: [] },
+  ): BashOperations {
+    return {
+      async exec(command, cwd, { onData, signal, timeout, env }) {
+        if (!existsSync(cwd)) throw new Error(`Working directory does not exist: ${cwd}`);
+
+        const provider = activeShellProvider();
+        const config = loadConfig(cwd);
+        const { token: proxyToken, authorization: proxyAuthorization } = createProxyCredentials();
+        const proxy = shouldStartProxy(config)
+          ? await startProxy(
+              ctx,
+              cwd,
+              allowances,
+              signal,
+              proxyAuthorization,
+              restrictedUserProxyPortRange(),
+            )
+          : null;
+
+        let policy: ReturnType<typeof writePolicyFile> | undefined;
+        let invocation: LandstripShellInvocation | undefined;
+        let processAllowances = allowances;
+        let teardownPromise: Promise<void> | undefined;
+        const teardownResources = (): Promise<void> => {
+          teardownPromise ??= Promise.all([
+            Promise.resolve().then(() => invocation?.dispose?.()),
+            Promise.resolve().then(() => {
+              if (policy) rmSync(policy.dir, { recursive: true, force: true });
+            }),
+            Promise.resolve().then(() => proxy?.stop()),
+          ]).then(() => undefined);
+          return teardownPromise;
+        };
+
+        let landstripArgs: string[];
+        try {
+          invocation = await provider.prepare({
+            command,
+            cwd,
+            env: shellEnvironment(env, cwd, proxy?.port ?? null, proxy ? proxyToken : undefined),
+            signal,
+          });
+          if (!invocation.executable.trim()) {
+            throw new Error(`Shell provider "${provider.id}" returned an empty executable`);
+          }
+          if (signal?.aborted) throw new Error('aborted');
+
+          processAllowances = {
+            ...allowances,
+            readPaths: [...allowances.readPaths, ...(invocation.readPaths ?? [])],
+          };
+          processAllowances = withWindowsProcessReadAccess(
+            processAllowances,
+            invocation.executable,
+            cwd,
+          );
+          policy = writePolicyFile(cwd, proxy?.port ?? null, 'shell', processAllowances);
+          landstripArgs = [
+            'run',
+            '-p',
+            policy.path,
+            '--',
+            invocation.executable,
+            ...invocation.args,
+          ];
+          if (process.platform !== 'win32') landstripArgs.splice(1, 0, '--trap', '3');
+        } catch (error) {
+          await teardownResources();
+          throw error;
+        }
+
+        return new Promise((resolvePromise, reject) => {
+          let pendingSocketPair: [NetSocket, NetSocket] | undefined;
+          (async () => {
+            let timeoutHandle: NodeJS.Timeout | undefined;
+            let timedOut = false;
+            let cleaned = false;
+            let trapSocket: NetSocket | undefined;
+            let childEnd: NetSocket | undefined;
+            if (process.platform !== 'win32') {
+              pendingSocketPair = await createSocketPair();
+              [trapSocket, childEnd] = pendingSocketPair;
+            }
+            if (signal?.aborted) throw new Error('aborted');
+            const cleanup = async () => {
+              if (cleaned) return;
+              cleaned = true;
+              if (timeoutHandle) clearTimeout(timeoutHandle);
+              signal?.removeEventListener('abort', onAbort);
+              trapSocket?.destroy();
+              await teardownResources();
+            };
+
+            const stdio: StdioOptions = childEnd
+              ? ['ignore', 'pipe', 'pipe', childEnd]
+              : ['ignore', 'pipe', 'pipe'];
+            const child: ChildProcess = spawn(binaryPath(), landstripArgs, {
+              cwd,
+              env: createLandstripLauncherEnvironment(invocation.launcherEnv),
+              detached: true,
+              stdio,
+            });
+            patchProcessGroupKill(child);
+
+            // Child has dup'd its end; parent can close its copy.
+            childEnd?.destroy();
+            pendingSocketPair = undefined;
+
+            function killChild(): void {
+              child.kill('SIGKILL');
+            }
+
+            function onAbort(): void {
+              killChild();
+            }
+
+            if (timeout !== undefined && timeout > 0) {
+              timeoutHandle = setTimeout(() => {
+                timedOut = true;
+                killChild();
+              }, timeout * 1000);
+            }
+
+            signal?.addEventListener('abort', onAbort, { once: true });
+            if (signal?.aborted) onAbort();
+            let stderrAcc = '';
+            let errorFdAcc = '';
+
+            let execSettled = false;
+            let childExited = false;
+            let childExitCode: number | null = null;
+            let postExitTimer: NodeJS.Timeout | undefined;
+            let stdoutEnded = child.stdout === null;
+            let stderrEnded = child.stderr === null;
+
+            const finalizeExec = (code: number | null): void => {
+              if (execSettled) return;
+              execSettled = true;
+              if (postExitTimer) clearTimeout(postExitTimer);
+              // Stop tracking the inherited pipes: a backgrounded grandchild can
+              // hold them open after the command itself exits, so 'close' would
+              // otherwise never arrive.
+              child.stdout?.destroy();
+              child.stderr?.destroy();
+              void (async () => {
+                await cleanup();
+                if (signal?.aborted) {
+                  reject(new Error('aborted'));
+                  return;
+                }
+                if (timedOut) {
+                  reject(new Error(`timeout:${timeout}`));
+                  return;
+                }
+
+                // Structured traps are trusted only from the trap socket; on
+                // Windows, where --trap is unsupported, use native
+                // kernel-denial text from stderr.
+                const blockedPath =
+                  extractTrapBlockedPath(errorFdAcc, cwd) ??
+                  extractNativeDeniedPath(stderrAcc, cwd);
+                if (!blockedPath && ctx.hasUI) {
+                  const traps = parseLandstripTraps(errorFdAcc);
+                  const denials = traps.filter(isDenialTrap);
+                  if (denials.length > 0) {
+                    const formatted = formatLandstripTraps(denials);
+                    notify(ctx, `Sandbox blocked an operation: ${formatted}`, 'warning');
+                  }
+
+                  const failures = traps.filter((trap) => !isDenialTrap(trap));
+                  if (failures.length > 0) {
+                    notify(ctx, `Sandbox failed: ${formatLandstripTraps(failures)}`, 'error');
+                  }
+                }
+
+                resolvePromise({ exitCode: code });
+              })().catch(reject);
+            };
+
+            const maybeFinalizeAfterExit = (): void => {
+              if (childExited && !execSettled && stdoutEnded && stderrEnded) {
+                finalizeExec(childExitCode);
+              }
+            };
+
+            child.stdout?.on('data', onData);
+            child.stderr?.on('data', (data: Buffer) => {
+              stderrAcc += data.toString('utf8');
+              callbacks.onStderr?.(data);
+              onData(data);
+            });
+            child.stdout?.once('end', () => {
+              stdoutEnded = true;
+              maybeFinalizeAfterExit();
+            });
+            child.stderr?.once('end', () => {
+              stderrEnded = true;
+              maybeFinalizeAfterExit();
+            });
+            const trapDecoder = new StringDecoder('utf8');
+            let trapBuffer = '';
+            let queryChain: Promise<void> = Promise.resolve();
+
+            const respondQuery = (
+              queryId: string,
+              action: LandstripControlResponse['action'],
+            ): void => {
+              if (!trapSocket || trapSocket.destroyed) return;
+              trapSocket.write(controlResponseLine(queryId, action));
+            };
+
+            // Surface a denial through the error-fd accumulator so the post-close
+            // notify and the runBashWithOptionalRetry prompt/retry paths still work.
+            const appendErrorLine = (line: string): void => {
+              const infoLine = line + '\n';
+              errorFdAcc += infoLine;
+              callbacks.onErrorFd?.(Buffer.from(infoLine, 'utf8'));
+            };
+
+            trapSocket?.on('data', (data: Buffer) => {
+              trapBuffer += trapDecoder.write(data);
+              let nl = trapBuffer.indexOf('\n');
+              while (nl !== -1) {
+                const line = trapBuffer.slice(0, nl);
+                trapBuffer = trapBuffer.slice(nl + 1);
+                nl = trapBuffer.indexOf('\n');
+                if (line.length === 0) continue;
+                const trap = parseTrapLine(line);
+                // An unanswered query holds the child's syscall, so every query
+                // gets an answer; anything else is informational and kept for
+                // post-close handling.
+                if (trap && isQueryTrap(trap)) {
+                  queryChain = queryChain
+                    .then(async () => {
+                      const result = await resolveTrapQuery(
+                        trap,
+                        ctx,
+                        cwd,
+                        processAllowances,
+                        callbacks.promptOnBlock === true,
+                        signal,
+                      );
+                      if (
+                        result.reason === 'unprompted' ||
+                        (!isFilesystemTrap(trap) && result.reason === 'rejected')
+                      ) {
+                        appendErrorLine(line);
+                      }
+                      respondQuery(trap.query_id, result.action);
+                    })
+                    .catch(() => respondQuery(trap.query_id, 'deny'));
+                } else {
+                  appendErrorLine(line);
+                }
+              }
+            });
+
+            child.on('error', (error) => {
+              if (execSettled) return;
+              execSettled = true;
+              if (postExitTimer) clearTimeout(postExitTimer);
+              void (async () => {
+                try {
+                  await cleanup();
+                  reject(error);
+                } catch (cleanupError) {
+                  reject(cleanupError);
+                }
+              })();
+            });
+
+            // Settle on 'exit' — the command itself has ended — rather than
+            // waiting for 'close', which only fires once every inherited stdio
+            // pipe is closed. A backgrounded process holding one open would
+            // otherwise block us indefinitely.
+            child.once('exit', (code) => {
+              childExited = true;
+              childExitCode = code;
+              maybeFinalizeAfterExit();
+              if (!execSettled) {
+                postExitTimer = setTimeout(() => finalizeExec(code), EXIT_STDIO_GRACE_MS);
+              }
+            });
+            child.once('close', (code) => finalizeExec(code));
+          })().catch((error: unknown) => {
+            // A failure before the child is wired (for example, creating the trap
+            // channel) never reaches cleanup(), so free temporary resources here.
+            pendingSocketPair?.forEach((socket) => socket.destroy());
+            void teardownResources().then(
+              () => reject(error),
+              (cleanupError) =>
+                reject(new AggregateError([error, cleanupError], 'Shell setup and cleanup failed')),
+            );
+          });
+        });
+      },
+    };
+  }
+
+  async function runBashWithOptionalRetry(
+    id: string,
+    params: BashToolInput,
+    signal: AbortSignal | undefined,
+    onUpdate: AgentToolUpdateCallback<BashToolDetails | undefined> | undefined,
+    ctx: ExtensionContext,
+  ): Promise<AgentToolResult<BashToolDetails | undefined>> {
+    let landstripErrorOutput = '';
+    let stderrOutput = '';
+    const allowances: ExecutionAllowances = {
+      domains: [],
+      readPaths: [],
+      writePaths: [],
+      targets: [],
+    };
+    const sandboxedBash = createBashToolDefinition(ctx.cwd, {
+      operations: createLandstripBashOps(
+        ctx,
+        {
+          onErrorFd: (data) => {
+            landstripErrorOutput += data.toString('utf8');
+          },
+          onStderr: (data) => {
+            stderrOutput += data.toString('utf8');
+          },
+          promptOnBlock: true,
+        },
+        allowances,
+      ),
+      shellPath: SettingsManager.create(ctx.cwd).getShellPath(),
+    });
+
+    const run = () => sandboxedBash.execute(id, params, signal, onUpdate, ctx);
+    const blockedReadPathForRetry = (nativeOutput: string): string | null => {
+      const config = loadConfig(ctx.cwd);
+      if (!enforcesShellReadPolicy(config.shell.readAccess)) return null;
+
+      const trappedPath = extractTrapBlockedPath(landstripErrorOutput, ctx.cwd, 'read');
+      if (trappedPath) return trappedPath;
+
+      return extractRetryableNativeReadDeniedPath(
+        nativeOutput,
+        ctx.cwd,
+        getEffectiveAllowRead(config, ctx.cwd, allowances),
+        getEffectiveDenyRead(config, ctx.cwd),
+      );
+    };
+    const retryWithAccess = async (
+      operation: 'read' | 'write',
+      blockedPath: string,
+    ): Promise<AgentToolResult<BashToolDetails | undefined> | null> => {
+      if (!ctx.hasUI) return null;
+
+      const { globalPath, projectPath } = getPiConfigPaths(ctx.cwd, 'sandbox.json');
+      const current = (): boolean | undefined => {
+        const config = loadConfig(ctx.cwd);
+        if (
+          matchesPattern(
+            blockedPath,
+            operation === 'read'
+              ? config.filesystem.denyReadAlways
+              : mergeArray(config.filesystem.denyWriteAlways, config.filesystem.denyWrite),
+            ctx.cwd,
+          )
+        ) {
+          return false;
+        }
+        const needsPrompt =
+          operation === 'read'
+            ? !readAllowed(
+                blockedPath,
+                getEffectiveAllowRead(config, ctx.cwd, allowances),
+                getEffectiveDenyRead(config, ctx.cwd),
+                ctx.cwd,
+              )
+            : shouldPromptForWrite(
+                blockedPath,
+                getEffectiveAllowWrite(config, allowances),
+                ctx.cwd,
+              );
+        return needsPrompt ? undefined : true;
+      };
+      const access = await permissionPrompts.resolve(
+        current,
+        async (promptSignal) => {
+          const config = loadConfig(ctx.cwd);
+          const choice =
+            operation === 'read'
+              ? await promptReadBlock(
+                  ctx,
+                  blockedPath,
+                  matchesPattern(blockedPath, config.filesystem.denyRead, ctx.cwd)
+                    ? 'granting allowRead will override it'
+                    : undefined,
+                  promptSignal,
+                )
+              : await showPermissionPrompt(
+                  ctx,
+                  `Write blocked: "${blockedPath}" is not in allowWrite`,
+                  PERMISSION_OPTIONS,
+                  promptSignal,
+                );
+          if (choice === 'abort' || promptSignal.aborted) return false;
+          if (operation === 'read') {
+            await applyReadChoice(ctx, choice, blockedPath, ctx.cwd, allowances);
+          } else {
+            await applyWriteChoice(ctx, choice, blockedPath, ctx.cwd, allowances);
+          }
+          return true;
+        },
+        signal,
+      );
+      if (!access) {
+        const config = loadConfig(ctx.cwd);
+        if (
+          operation === 'write' &&
+          (matchesPattern(blockedPath, config.filesystem.denyWriteAlways, ctx.cwd) ||
+            matchesPattern(blockedPath, config.filesystem.denyWrite, ctx.cwd))
+        ) {
+          const tier = matchesPattern(blockedPath, config.filesystem.denyWriteAlways, ctx.cwd)
+            ? 'denyWriteAlways'
+            : 'denyWrite';
+          notify(
+            ctx,
+            `"${blockedPath}" is blocked by ${tier}. Check:\n  ${projectPath}\n  ${globalPath}`,
+            'warning',
+          );
+        }
+        return null;
+      }
+
+      let config = loadConfig(ctx.cwd);
+      if (
+        operation === 'write' &&
+        (matchesPattern(blockedPath, config.filesystem.denyWriteAlways, ctx.cwd) ||
+          matchesPattern(blockedPath, config.filesystem.denyWrite, ctx.cwd))
+      ) {
+        const tier = matchesPattern(blockedPath, config.filesystem.denyWriteAlways, ctx.cwd)
+          ? 'denyWriteAlways'
+          : 'denyWrite';
+        notify(
+          ctx,
+          `"${blockedPath}" was added to allowWrite, but ${tier} still blocks it. Check:\n  ${projectPath}\n  ${globalPath}`,
+          'warning',
+        );
+        return null;
+      }
+
+      onUpdate?.({
+        content: [
+          {
+            type: 'text',
+            text: `\n--- ${operation === 'read' ? 'Read' : 'Write'} access granted for "${blockedPath}", retrying ---\n`,
+          },
+        ],
+        details: {},
+      });
+      landstripErrorOutput = '';
+      stderrOutput = '';
+      return run();
+    };
+
+    let result: AgentToolResult<BashToolDetails | undefined>;
+    try {
+      result = await run();
+    } catch (error) {
+      const errorText = formatError(error);
+      const fallbackOutput = `${stderrOutput}\n${errorText}`;
+      const blockedWritePath =
+        extractTrapBlockedPath(landstripErrorOutput, ctx.cwd, 'write') ??
+        extractNativeWriteDeniedPath(fallbackOutput, ctx.cwd);
+      if (blockedWritePath) {
+        const retryResult = await retryWithAccess('write', blockedWritePath);
+        if (retryResult) return retryResult;
+      }
+
+      const blockedReadPath = blockedReadPathForRetry(fallbackOutput);
+      if (blockedReadPath) {
+        const retryResult = await retryWithAccess('read', blockedReadPath);
+        if (retryResult) return retryResult;
+      }
+
+      const landstripErrors = parseLandstripTraps(landstripErrorOutput);
+      if (landstripErrors.length > 0) {
+        throw new Error(formatLandstripTraps(landstripErrors));
+      }
+      throw error;
+    }
+    const landstripErrors = parseLandstripTraps(landstripErrorOutput);
+    if (landstripErrors.length > 0) {
+      const message = formatLandstripTraps(landstripErrors);
+      result.content.unshift({ type: 'text', text: `\n${message}\n` });
+    }
+    const blockedWritePath =
+      extractTrapBlockedPath(landstripErrorOutput, ctx.cwd, 'write') ??
+      extractNativeWriteDeniedPath(stderrOutput, ctx.cwd);
+    if (blockedWritePath) {
+      const retryResult = await retryWithAccess('write', blockedWritePath);
+      if (retryResult) return retryResult;
+    }
+
+    const blockedReadPath = blockedReadPathForRetry(stderrOutput);
+    if (!blockedReadPath) return result;
+
+    const retryResult = await retryWithAccess('read', blockedReadPath);
+    return retryResult ?? result;
+  }
+
+  function warnIfAllDomainsAllowed(ctx: ExtensionContext, config: SandboxConfig): void {
+    if (config.network.allowNetwork) {
+      notify(ctx, 'Network sandbox is disabled because network.allowNetwork is true.', 'warning');
+      return;
+    }
+    if (!allowsAllDomains(config.network.allowedDomains)) return;
+    notify(
+      ctx,
+      'Network sandbox allows all domains because network.allowedDomains contains "*".',
+      'warning',
+    );
+  }
+
+  function warnIfWindowsSecurityDowngraded(ctx: ExtensionContext, config: SandboxConfig): void {
+    if (process.platform !== 'win32') return;
+    let implementation: WindowsImplementation;
+    try {
+      implementation = windowsStatus().active;
+    } catch (error) {
+      notify(ctx, formatError(error), 'error');
+      return;
+    }
+    if (implementation !== 'appContainer') return;
+    if (config.windows.appContainerMode === 'standard') {
+      notify(
+        ctx,
+        'Windows uses standard AppContainer mode, which is weaker than LPAC isolation.',
+        'warning',
+      );
+    }
+    if (config.windows.allowLoopback) {
+      notify(
+        ctx,
+        'Windows loopback access includes all local loopback services, not only the Landstrip proxy.',
+        'warning',
+      );
+    }
+  }
+
+  function enableStatus(ctx: ExtensionContext, config: SandboxConfig): void {
+    if (!hasTuiStatus(ctx)) return;
+    const theme = ctx.ui.theme;
+    const dot = theme.fg('success', '●');
+    const label = theme.fg('text', 'Sandbox');
+
+    const windowsImplementation = process.platform === 'win32' ? windowsStatus().active : undefined;
+    let networkLabel: string;
+    let networkColor: 'warning' | 'accent';
+    if (config.network.allowNetwork) {
+      networkLabel = 'unrestricted';
+      networkColor = 'warning';
+    } else if (windowsImplementation === 'appContainer' && !config.windows.allowLoopback) {
+      networkLabel = 'blocked';
+      networkColor = 'accent';
+    } else if (allowsAllDomains(config.network.allowedDomains)) {
+      networkLabel = 'any domain';
+      networkColor = 'warning';
+    } else {
+      networkLabel = `${config.network.allowedDomains.length} domains`;
+      networkColor = 'accent';
+    }
+
+    const sep = theme.fg('dim', '·');
+    const net = theme.fg(networkColor, networkLabel);
+    const write = theme.fg('accent', `${config.filesystem.allowWrite.length} write paths`);
+    const fields = [`${dot} ${label}`, net, write];
+    if (windowsImplementation !== undefined) {
+      const standard =
+        windowsImplementation === 'appContainer' && config.windows.appContainerMode === 'standard';
+      const implementationLabel =
+        windowsImplementation === 'restrictedUser'
+          ? 'restricted user'
+          : `${config.windows.appContainerMode} AppContainer`;
+      fields.splice(1, 0, theme.fg(standard ? 'warning' : 'accent', implementationLabel));
+    }
+
+    setTuiStatus(ctx, 'sandbox', fields.join(`  ${sep}  `));
+  }
+
+  const headlessWarnings = new Set<string>();
+
+  // Explicitly disabling sandboxing permits the legacy unsandboxed fallback.
+  // Initialization failures remain fail-closed so commands never bypass policy silently.
+  function warnUnsandboxed(ctx: ExtensionContext, message: string, level: NotificationLevel): void {
+    notify(ctx, message, level);
+    if (!ctx.hasUI && !headlessWarnings.has(message)) {
+      headlessWarnings.add(message);
+      console.error(`pi-landstrip: ${message}`);
+    }
+  }
+
+  function enableSandbox(ctx: ExtensionContext): boolean {
+    const config = loadConfig(ctx.cwd);
+
+    if (!SUPPORTED_PLATFORMS.has(process.platform)) {
+      sandboxEnabled = false;
+      sandboxReady = false;
+      setSandboxState('unavailable', ctx);
+      warnUnsandboxed(
+        ctx,
+        `landstrip sandboxing is not supported on ${process.platform}`,
+        'warning',
+      );
+      return false;
+    }
+
+    // Resolve through the plugin dependency. A missing platform package is a
+    // broken installation and must abort enablement instead of selecting an
+    // unsandboxed execution route.
+    binaryPath();
+
+    sandboxEnabled = true;
+    sandboxReady = true;
+    setSandboxState('enabled', ctx);
+    warnIfAllDomainsAllowed(ctx, config);
+    warnIfWindowsSecurityDowngraded(ctx, config);
+    enableStatus(ctx, config);
+    return true;
+  }
+
+  let getNoSandboxFlag = (): boolean => false;
+  function disableSandbox(ctx: ExtensionContext): void {
+    sandboxEnabled = false;
+    sandboxReady = false;
+    setSandboxState('disabled', ctx);
+    setTuiStatus(ctx, 'sandbox', undefined);
+  }
+
+  function ensureSandboxState(ctx: ExtensionContext): boolean {
+    if (getNoSandboxFlag()) {
+      disableSandbox(ctx);
+      return false;
+    }
+
+    const config = loadConfig(ctx.cwd);
+    if (!config.enabled) {
+      disableSandbox(ctx);
+      return false;
+    }
+
+    if (!sandboxEnabled || !sandboxReady) return enableSandbox(ctx);
+    return true;
+  }
+
+  function createBashTool(cwd: string): LandstripBashTool {
+    const localBash = createBashToolDefinition(cwd, {
+      shellPath: SettingsManager.create(cwd).getShellPath(),
+    });
+
+    return {
+      ...localBash,
+      label: 'bash (landstrip)',
+      description: 'Execute commands with the active Landstrip shell provider.',
+      async execute(id, params, signal, onUpdate, ctx) {
+        if (!ctx) throw new Error('Sandbox context is unavailable');
+        if (!ensureSandboxState(ctx)) {
+          if (sandboxState === 'unavailable') {
+            throw new Error('Sandbox is unavailable; refusing command');
+          }
+          if (externalShellProvider !== undefined) {
+            const providerBash = createBashToolDefinition(ctx.cwd, {
+              operations: createProviderBashOps(),
+              shellPath: SettingsManager.create(ctx.cwd).getShellPath(),
+            });
+            return providerBash.execute(id, params, signal, onUpdate, ctx);
+          }
+          return localBash.execute(id, params, signal, onUpdate, ctx);
+        }
+
+        return runBashWithOptionalRetry(id, params, signal, onUpdate, ctx);
+      },
+    };
+  }
+
+  function register(pi: ExtensionAPI): void {
+    const maybePi = pi as ExtensionAPI & {
+      getFlag?: (name: string) => unknown;
+      registerCommand?: ExtensionAPI['registerCommand'];
+      registerFlag?: ExtensionAPI['registerFlag'];
+    };
+
+    maybePi.registerFlag?.('no-sandbox', {
+      description: 'Disable Landstrip OS sandboxing',
+      type: 'boolean',
+      default: false,
+    });
+    getNoSandboxFlag = () => Boolean(maybePi.getFlag?.('no-sandbox'));
+
+    unpublishRuntime?.();
+    unpublishRuntime = publishLandstripRuntime(pi, integration);
+
+    if (shouldRegisterBashTool) pi.registerTool(createBashTool(localCwd));
+
+    pi.on('user_bash', async (_event, ctx) => {
+      if (!ensureSandboxState(ctx)) {
+        if (sandboxState === 'unavailable') {
+          throw new Error('Sandbox is unavailable; refusing command');
+        }
+        if (externalShellProvider !== undefined) {
+          return { operations: createProviderBashOps() };
+        }
+        return;
+      }
+
+      return { operations: createLandstripBashOps(ctx, { promptOnBlock: true }) };
+    });
+
+    pi.on('session_start', async (_event, ctx) => {
+      activeContext = ctx;
+      permissionPrompts.reset();
+      sessionAllowedDomains.length = 0;
+      sessionAllowedReadPaths.length = 0;
+      sessionAllowedWritePaths.length = 0;
+      sessionAllowedTargets.length = 0;
+      unsandboxedWorkerWarningShown = false;
+      const trustContext = ctx as ExtensionContext & { isProjectTrusted?: () => boolean };
+      projectConfigTrusted = trustContext.isProjectTrusted?.() ?? false;
+      if (getNoSandboxFlag()) {
+        disableSandbox(ctx);
+        notify(ctx, 'Sandbox disabled via --no-sandbox', 'warning');
+        if (!unpublishRuntime) unpublishRuntime = publishLandstripRuntime(pi, integration);
+        return;
+      }
+
+      const config = loadConfig(ctx.cwd);
+      if (!config.enabled) {
+        disableSandbox(ctx);
+        notify(ctx, 'Sandbox disabled via config', 'info');
+        if (!unpublishRuntime) unpublishRuntime = publishLandstripRuntime(pi, integration);
+        return;
+      }
+
+      enableSandbox(ctx);
+      if (!unpublishRuntime) unpublishRuntime = publishLandstripRuntime(pi, integration);
+    });
+    pi.on('session_shutdown', () => {
+      permissionPrompts.reset();
+      activeContext = undefined;
+      unpublishRuntime?.();
+      unpublishRuntime = undefined;
+    });
+  }
+
+  async function applySandboxSetting(
+    ctx: ExtensionContext,
+    enabled: boolean | undefined,
+    scope: SandboxConfigScope,
+  ): Promise<void> {
+    await writeSandboxConfigEnabled(ctx.cwd, enabled, scope);
+    const effectiveEnabled = loadConfig(ctx.cwd).enabled;
+    if (!effectiveEnabled) {
+      disableSandbox(ctx);
+    } else if (!getNoSandboxFlag()) {
+      enableSandbox(ctx);
+    }
+  }
+
+  function sandboxOverview(cwd: string, includeProject: boolean): SandboxOverview {
+    const config = loadSandboxConfig(cwd, includeProject);
+    const { globalPath, projectPath } = getPiConfigPaths(cwd, 'sandbox.json');
+    const windowsImplementation = process.platform === 'win32' ? windowsStatus().active : undefined;
+    return {
+      enabled: config.enabled,
+      running: sandboxEnabled && sandboxReady,
+      noSandboxFlag: getNoSandboxFlag(),
+      networkMode: config.network.allowNetwork
+        ? 'unrestricted'
+        : windowsImplementation === 'appContainer' && !config.windows.allowLoopback
+          ? 'blocked'
+          : 'proxied',
+      shellReadMode: process.platform === 'win32' ? 'policy' : config.shell.readAccess,
+      readRuleScope: enforcesShellReadPolicy(config.shell.readAccess)
+        ? 'Workers and shell'
+        : 'Workers only',
+      windowsMode:
+        windowsImplementation === undefined
+          ? undefined
+          : windowsImplementation === 'restrictedUser'
+            ? 'Restricted user'
+            : `AppContainer (${config.windows.appContainerMode})`,
+      changeScope: getSandboxConfigWriteTarget(cwd, includeProject).scope,
+      paths: { global: globalPath, project: projectPath, binary: binaryPath() },
+      config,
+      sessionDomains: [...sessionAllowedDomains],
+      sessionReadPaths: [...sessionAllowedReadPaths],
+      sessionWritePaths: [...sessionAllowedWritePaths],
+    };
+  }
+
+  const sandboxCallbacks: SandboxCallbacks = {
+    load: loadSandboxEnabledSettings,
+    setEnabled: (ctx, enabled, scope) => applySandboxSetting(ctx, enabled, scope),
+    clearProject: (ctx) => applySandboxSetting(ctx, undefined, 'project'),
+    overview: sandboxOverview,
+  };
+
+  const integration: LandstripIntegration = {
+    version: LANDSTRIP_RUNTIME_VERSION,
+    getContext,
+    getExtensionContext: () => activeContext,
+    registerShellProvider,
+    registerPermissionAskProvider,
+    resolvePermissionAsk,
+    prepareProcess,
+    prepareRpcWorker,
+    authorizeFilesystemToolAccess,
+    registerWorkerExtension,
+    getWorkerExtensions,
+    on,
+    register,
+    emit: emitEvent,
+    sandboxCallbacks,
+  };
+  return integration;
+}

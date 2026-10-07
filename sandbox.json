@@ -1,0 +1,33 @@
+{
+  "enabled": true,
+  "shell": {
+    "readAccess": "host"
+  },
+  "network": {
+    "allowNetwork": false,
+    "allowLocalBinding": false,
+    "allowAllUnixSockets": false,
+    "allowUnixSockets": [],
+    "allowedDomains": [],
+    "deniedDomains": []
+  },
+  "filesystem": {
+    "denyRead": ["/Users", "/home"],
+    "denyReadAlways": [],
+    "allowRead": [".", "~/.gitconfig", "~/.config/git/config", "/dev/null"],
+    "allowWrite": [".", "/dev/null"],
+    "denyWrite": [
+      "**/.env",
+      "**/.env.*",
+      "**/*.pem",
+      "**/*.key",
+      ".pi/sandbox.json",
+      "~/.pi/agent/sandbox.json"
+    ],
+    "denyWriteAlways": []
+  },
+  "windows": {
+    "appContainerMode": "standard",
+    "allowLoopback": false
+  }
+}
