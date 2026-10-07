@@ -1,18 +1,17 @@
 {
-  "name": "pi-landstrip",
-  "version": "0.19.7",
-  "description": "Sandboxed Bash and process-backed agents for Pi",
+  "name": "omp-landstrip",
+  "version": "0.1.0",
+  "description": "Sandboxed bash tool for omp (Oh My Pi)",
   "keywords": [
     "landstrip",
-    "pi-extension",
-    "pi-package",
-    "sandbox",
-    "subagents"
+    "omp-extension",
+    "omp-package",
+    "sandbox"
   ],
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/landstrip/landstrip.git"
+    "url": "git+https://github.com/codeignus/omp-landstrip.git"
   },
   "files": [
     "dist/",
