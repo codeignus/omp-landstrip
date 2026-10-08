@@ -90,12 +90,34 @@ export interface SandboxConfig extends BaseSandboxConfig {
   shell: SandboxShellConfig;
   windows: SandboxWindowsConfig;
 }
-import type {
-  LandstripShellInvocation,
-  LandstripShellPrepareOptions,
-  LandstripShellProvider,
-} from './api.ts';
-import { getOmpConfigPaths } from './config.ts';
+interface LandstripShellPrepareOptions {
+  readonly command: string;
+  readonly cwd: string;
+  readonly env: NodeJS.ProcessEnv;
+  readonly signal?: AbortSignal;
+}
+
+interface LandstripShellInvocation {
+  readonly executable: string;
+  readonly args: readonly string[];
+  readonly launcherEnv: NodeJS.ProcessEnv;
+  readonly readPaths?: readonly string[];
+  dispose?(): void | Promise<void>;
+}
+
+interface LandstripShellProvider {
+  readonly id: string;
+  prepare(
+    options: LandstripShellPrepareOptions,
+  ): LandstripShellInvocation | Promise<LandstripShellInvocation>;
+}
+
+function getOmpConfigPaths(
+  cwd: string,
+  fileName: string,
+): { globalPath: string; projectPath: string } {
+  return { globalPath: join(getAgentDir(), fileName), projectPath: join(cwd, '.omp', fileName) };
+}
 import { formatError, PermissionPromptCoordinator, withFileMutationQueue } from './util.ts';
 
 export type SandboxConfigScope = 'global' | 'project';
@@ -292,42 +314,6 @@ function readOrEmptyConfig(configPath: string): SandboxConfigFile {
 function writeConfigFile(configPath: string, config: SandboxConfigFile): void {
   mkdirSync(dirname(configPath), { recursive: true });
   writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf-8');
-}
-
-function getSandboxConfigWriteTarget(
-  cwd: string,
-  includeProject = true,
-): { scope: SandboxConfigScope; path: string } {
-  const { globalPath, projectPath } = getOmpConfigPaths(cwd, 'sandbox.json');
-  return includeProject
-    ? { scope: 'project', path: projectPath }
-    : { scope: 'global', path: globalPath };
-}
-
-async function writeSandboxConfigEnabled(
-  cwd: string,
-  enabled: boolean | undefined,
-  scope: SandboxConfigScope,
-): Promise<void> {
-  const paths = getOmpConfigPaths(cwd, 'sandbox.json');
-  const path = scope === 'project' ? paths.projectPath : paths.globalPath;
-  await withFileMutationQueue(path, async () => {
-    const config = readOrEmptyConfig(path);
-    if (enabled === undefined) delete config.enabled;
-    else config.enabled = enabled;
-    writeConfigFile(path, config);
-  });
-}
-
-function loadSandboxEnabledSettings(
-  cwd: string,
-  includeProject: boolean,
-): { global: boolean; project?: boolean } {
-  const { projectPath } = getOmpConfigPaths(cwd, 'sandbox.json');
-  const global = loadSandboxConfig(cwd, false).enabled;
-  if (!includeProject || !existsSync(projectPath)) return { global };
-  const project = readOrEmptyConfig(projectPath).enabled;
-  return { global, project };
 }
 
 async function addConfigValue(
@@ -671,33 +657,6 @@ export interface LandstripIntegration {
   register(pi: ExtensionAPI): void;
   /** Return the active extension context, when a session is running. */
   getExtensionContext(): ExtensionContext | undefined;
-  /** Callbacks for querying and toggling sandbox state. */
-  readonly sandboxCallbacks?: SandboxCallbacks;
-}
-
-/** Callbacks for editing sandbox state from the agents dashboard. */
-export interface SandboxCallbacks {
-  load(cwd: string, includeProject: boolean): { global: boolean; project?: boolean };
-  setEnabled(ctx: ExtensionContext, enabled: boolean, scope: SandboxConfigScope): Promise<void>;
-  clearProject(ctx: ExtensionContext): Promise<void>;
-  overview(cwd: string, includeProject: boolean): SandboxOverview;
-}
-
-/** Display data for the sandbox section of the settings pane. */
-export interface SandboxOverview {
-  readonly enabled: boolean;
-  readonly running: boolean;
-  readonly noSandboxFlag: boolean;
-  readonly networkMode: 'unrestricted' | 'blocked' | 'proxied';
-  readonly shellReadMode: 'host' | 'policy';
-  readonly readRuleScope: string;
-  readonly windowsMode?: string;
-  readonly changeScope: SandboxConfigScope;
-  readonly paths: { readonly global: string; readonly project: string; readonly binary: string };
-  readonly config: SandboxConfig;
-  readonly sessionDomains: readonly string[];
-  readonly sessionReadPaths: readonly string[];
-  readonly sessionWritePaths: readonly string[];
 }
 
 /** Register the landstrip extension with omp. */
@@ -1749,7 +1708,6 @@ function createLandstripIntegrationWithPrompts(
     return true;
   }
 
-  let getNoSandboxFlag = (): boolean => false;
   function disableSandbox(ctx: ExtensionContext): void {
     sandboxEnabled = false;
     sandboxReady = false;
@@ -1881,63 +1839,8 @@ function createLandstripIntegrationWithPrompts(
     });
   }
 
-  async function applySandboxSetting(
-    ctx: ExtensionContext,
-    enabled: boolean | undefined,
-    scope: SandboxConfigScope,
-  ): Promise<void> {
-    await writeSandboxConfigEnabled(ctx.cwd, enabled, scope);
-    const effectiveEnabled = loadConfig(ctx.cwd).enabled;
-    if (!effectiveEnabled) {
-      disableSandbox(ctx);
-    } else if (!getNoSandboxFlag()) {
-      enableSandbox(ctx);
-    }
-  }
-
-  function sandboxOverview(cwd: string, includeProject: boolean): SandboxOverview {
-    const config = loadSandboxConfig(cwd, includeProject);
-    const { globalPath, projectPath } = getOmpConfigPaths(cwd, 'sandbox.json');
-    const windowsImplementation = process.platform === 'win32' ? windowsStatus().active : undefined;
-    return {
-      enabled: config.enabled,
-      running: sandboxEnabled && sandboxReady,
-      noSandboxFlag: getNoSandboxFlag(),
-      networkMode: config.network.allowNetwork
-        ? 'unrestricted'
-        : windowsImplementation === 'appContainer' && !config.windows.allowLoopback
-          ? 'blocked'
-          : 'proxied',
-      shellReadMode: process.platform === 'win32' ? 'policy' : config.shell.readAccess,
-      readRuleScope: enforcesShellReadPolicy(config.shell.readAccess)
-        ? 'Workers and shell'
-        : 'Workers only',
-      windowsMode:
-        windowsImplementation === undefined
-          ? undefined
-          : windowsImplementation === 'restrictedUser'
-            ? 'Restricted user'
-            : `AppContainer (${config.windows.appContainerMode})`,
-      changeScope: getSandboxConfigWriteTarget(cwd, includeProject).scope,
-      paths: { global: globalPath, project: projectPath, binary: binaryPath() },
-      config,
-      sessionDomains: [...sessionAllowedDomains],
-      sessionReadPaths: [...sessionAllowedReadPaths],
-      sessionWritePaths: [...sessionAllowedWritePaths],
-    };
-  }
-
-  const sandboxCallbacks: SandboxCallbacks = {
-    load: loadSandboxEnabledSettings,
-    setEnabled: (ctx, enabled, scope) => applySandboxSetting(ctx, enabled, scope),
-    clearProject: (ctx) => applySandboxSetting(ctx, undefined, 'project'),
-    overview: sandboxOverview,
-  };
-
-  const integration: LandstripIntegration = {
+  return {
     getExtensionContext: () => activeContext,
     register,
-    sandboxCallbacks,
   };
-  return integration;
 }

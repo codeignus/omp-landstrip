@@ -15,14 +15,12 @@
   },
   "files": [
     "dist/",
-    "api.ts",
     "README.md",
     "sandbox.json"
   ],
   "type": "module",
   "exports": {
-    ".": "./dist/index.ts",
-    "./api": "./api.ts"
+    ".": "./dist/index.ts"
   },
   "scripts": {
     "build": "node -e \"const fs = require('node:fs'); fs.rmSync('dist', { recursive: true, force: true }); fs.mkdirSync('dist'); fs.copyFileSync('sandbox.json', 'dist/sandbox.json')\" && bun build index.ts --outfile dist/index.ts --target=node --packages=external",
@@ -38,16 +36,10 @@
     "ci:test": "npm run test"
   },
   "dependencies": {
-    "@landstrip/landstrip-api": "^0.19.7",
-    "jsonc-parser": "^3.3.1",
-    "minimatch": "^10.2.5",
-    "undici": "^8.9.0",
-    "yaml": "^2.9.0"
+    "@landstrip/landstrip-api": "^0.19.7"
   },
   "devDependencies": {
-    "@oh-my-pi/pi-ai": "18.1.5",
     "@oh-my-pi/pi-coding-agent": "18.1.5",
-    "@oh-my-pi/pi-tui": "18.1.5",
     "@types/node": "^26.4.1",
     "oxfmt": "^0.67.0",
     "oxlint": "^1.68.0",
@@ -56,9 +48,7 @@
     "vitest": "^5.0.0"
   },
   "peerDependencies": {
-    "@oh-my-pi/pi-ai": "*",
-    "@oh-my-pi/pi-coding-agent": ">=0.82.0",
-    "@oh-my-pi/pi-tui": "*",
+    "@oh-my-pi/pi-coding-agent": "*",
     "typebox": "*"
   },
   "engines": {
