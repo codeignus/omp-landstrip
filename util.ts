@@ -230,3 +230,23 @@ export class PermissionPromptCoordinator {
     controller.abort();
   }
 }
+
+const fileMutationQueues = new Map<string, AsyncQueue>();
+
+/**
+ * Serialize config-file mutations per path. Replaces the pi-host
+ * withFileMutationQueue, which omp does not export.
+ */
+export async function withFileMutationQueue(path: string, fn: () => Promise<void>): Promise<void> {
+  let queue = fileMutationQueues.get(path);
+  if (!queue) {
+    queue = new AsyncQueue();
+    fileMutationQueues.set(path, queue);
+  }
+  const release = await queue.acquire();
+  try {
+    await fn();
+  } finally {
+    release();
+  }
+}

@@ -4,7 +4,7 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, sep } from 'node:path';
 
-import { getAgentDir, withFileMutationQueue } from '@earendil-works/pi-coding-agent';
+import { getAgentDir } from '@oh-my-pi/pi-coding-agent';
 import {
   applyEdits,
   modify,
@@ -21,7 +21,7 @@ import {
   type LandstripConfigTarget,
 } from './config.ts';
 import { parseMarkdownAgentRaw } from './opencode-agents.ts';
-import { expandFileReferences, isRecord } from './util.ts';
+import { expandFileReferences, isRecord, withFileMutationQueue } from './util.ts';
 
 const JSON_FORMAT = {
   formattingOptions: { insertSpaces: true, tabSize: 2, eol: '\n' },

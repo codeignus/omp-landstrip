@@ -4,8 +4,8 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-import { getAgentDir, withFileMutationQueue } from '@earendil-works/pi-coding-agent';
-import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { getAgentDir } from '@oh-my-pi/pi-coding-agent';
+import type { ExtensionContext } from '@oh-my-pi/pi-coding-agent';
 import {
   applyEdits,
   modify,
@@ -14,7 +14,7 @@ import {
   type ParseError,
 } from 'jsonc-parser';
 
-import { expandFileReferences, formatError, isRecord } from './util.ts';
+import { expandFileReferences, formatError, isRecord, withFileMutationQueue } from './util.ts';
 
 const BUILT_IN_LANDSTRIP_CONFIG = {
   maxSubagents: 0,
@@ -215,8 +215,8 @@ function readLandstripConfigSource(
   scope: 'global' | 'project',
   agentDir: string,
 ): LandstripConfigSource {
-  const settingsPaths = getPiConfigPaths(cwd, 'settings.json', agentDir);
-  const dedicatedPaths = getPiConfigPaths(cwd, 'landstrip.json', agentDir);
+  const settingsPaths = getOmpConfigPaths(cwd, 'settings.json', agentDir);
+  const dedicatedPaths = getOmpConfigPaths(cwd, 'landstrip.json', agentDir);
   const settingsPath = scope === 'global' ? settingsPaths.globalPath : settingsPaths.projectPath;
   const dedicatedPath = scope === 'global' ? dedicatedPaths.globalPath : dedicatedPaths.projectPath;
   const settings = existsSync(settingsPath) ? readJsonObject(settingsPath) : undefined;
@@ -284,14 +284,14 @@ function recordAgentSources(
   }
 }
 
-export function getPiConfigPaths(
+export function getOmpConfigPaths(
   cwd: string,
   fileName: string,
   agentDir = getAgentDir(),
 ): { globalPath: string; projectPath: string } {
   return {
     globalPath: join(agentDir, fileName),
-    projectPath: join(cwd, '.pi', fileName),
+    projectPath: join(cwd, '.omp', fileName),
   };
 }
 

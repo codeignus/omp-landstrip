@@ -4,7 +4,7 @@
 import type { ChildProcess, SpawnOptions } from 'node:child_process';
 import type { Readable, Writable } from 'node:stream';
 
-import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import type { ExtensionAPI, ExtensionContext } from '@oh-my-pi/pi-coding-agent';
 
 import { isRecord } from '@landstrip/landstrip-api/shared';
 

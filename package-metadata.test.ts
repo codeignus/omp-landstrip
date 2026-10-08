@@ -56,13 +56,13 @@ describe('package metadata', () => {
   it('uses host-provided Pi extension dependencies', () => {
     const extensionPackage = readJson<PackageJson>(new URL('./package.json', import.meta.url));
 
-    expect(extensionPackage.dependencies?.['@earendil-works/pi-coding-agent']).toBeUndefined();
-    expect(extensionPackage.dependencies?.['@earendil-works/pi-ai']).toBeUndefined();
-    expect(extensionPackage.dependencies?.['@earendil-works/pi-tui']).toBeUndefined();
+    expect(extensionPackage.dependencies?.['@oh-my-pi/pi-coding-agent']).toBeUndefined();
+    expect(extensionPackage.dependencies?.['@oh-my-pi/pi-ai']).toBeUndefined();
+    expect(extensionPackage.dependencies?.['@oh-my-pi/pi-tui']).toBeUndefined();
     expect(extensionPackage.peerDependencies).toMatchObject({
-      '@earendil-works/pi-coding-agent': '>=0.82.0',
-      '@earendil-works/pi-ai': '>=0.82.0',
-      '@earendil-works/pi-tui': '*',
+      '@oh-my-pi/pi-coding-agent': '>=0.82.0',
+      '@oh-my-pi/pi-ai': '>=0.82.0',
+      '@oh-my-pi/pi-tui': '*',
       typebox: '*',
     });
   });

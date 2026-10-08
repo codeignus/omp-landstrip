@@ -5,8 +5,8 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
-} from '@earendil-works/pi-coding-agent';
-import { type AutocompleteItem, fuzzyFilter } from '@earendil-works/pi-tui';
+} from '@oh-my-pi/pi-coding-agent';
+import { type AutocompleteItem, fuzzyFilter } from '@oh-my-pi/pi-tui';
 import type { AgentCatalog } from './agents.ts';
 import {
   isProjectTrusted,

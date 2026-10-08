@@ -21,8 +21,8 @@
       "**/.env.*",
       "**/*.pem",
       "**/*.key",
-      ".pi/sandbox.json",
-      "~/.pi/agent/sandbox.json"
+      ".omp/sandbox.json",
+      "~/.omp/agent/sandbox.json"
     ],
     "denyWriteAlways": []
   },

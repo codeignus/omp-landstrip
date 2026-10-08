@@ -3,7 +3,7 @@
 
 import { join } from 'node:path';
 import { minimatch } from 'minimatch';
-import { getAgentDir } from '@earendil-works/pi-coding-agent';
+import { getAgentDir } from '@oh-my-pi/pi-coding-agent';
 
 import {
   loadLandstripConfig,
