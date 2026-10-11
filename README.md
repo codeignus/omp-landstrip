@@ -1,7 +1,8 @@
 # omp-landstrip
 
-Sandboxed bash tool for omp (Oh My Pi): OS-level filesystem and network
-confinement for model-driven shell execution, powered by the
+Sandboxed bash and file-write gating for omp (Oh My Pi): OS-level filesystem
+and network confinement for model-driven shell execution, plus policy
+enforcement on omp's native write tools, powered by the
 [landstrip](https://github.com/landstrip/landstrip) sandbox.
 
 ## What it covers
@@ -13,8 +14,16 @@ with a policy derived from your configuration; denials surface as tool
 errors instead of silent escapes. omp's native `task` subagents inherit
 the sandbox automatically because they consume the same tool registry.
 
-omp's own file tools (`read`, `write`, `edit`, ...) are host-native and are
-not gated by this package.
+omp's native file tools are gated through the `tool_call` extension event —
+the native tools stay registered (no shadowing), and every `write`, `edit`,
+and `ast_edit` dispatch is checked against the same `sandbox.json` policy
+before it runs: `denyWrite` / `denyWriteAlways` patterns block outright
+(including sqlite row and archive member writes, judged on their container
+file), `allowWrite` covers the rest, and anything else raises the approval
+prompt (headless runs block). `local://` plan drafts and `conflict://`
+merge state are session-owned and always allowed; `ssh://` remote writes
+and non-default `xd://` device dispatches prompt every time. This mirrors
+upstream pi-landstrip's design. `read` remains ungated for now.
 
 ## Install
 
@@ -55,7 +64,8 @@ cannot start, bash fails closed.
 
 ## Scope
 
-Sandboxed bash is the initial surface. The `/landstrip` management commands
+Sandboxed bash plus `write`/`edit`/`ast_edit` gating is the current surface;
+`read`-side gating is on the roadmap. The `/landstrip` management commands
 and dashboard pane known from pi-landstrip are not ported; the worker-based
 subagent system is intentionally omitted — omp's native `task` system is
 used instead and runs under the same sandboxed bash.
