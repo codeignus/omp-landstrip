@@ -107,6 +107,13 @@ function getOmpConfigPaths(
   return { globalPath: join(getAgentDir(), fileName), projectPath: join(cwd, '.omp', fileName) };
 }
 import { formatError, PermissionPromptCoordinator, withFileMutationQueue } from './util.ts';
+import { extractWriteTargets } from './write-targets.ts';
+import {
+  DEFAULT_XD_WRITE_DEVICES,
+  gateWriteTargets,
+  judgeWriteTarget,
+  type WriteGateDeps,
+} from './write-gate.ts';
 
 export type SandboxConfigScope = 'global' | 'project';
 
@@ -193,6 +200,19 @@ const PERMISSION_OPTIONS: PromptOption[] = [
 const NETWORK_PERMISSION_OPTIONS: PromptOption[] = [
   { label: 'Allow once', action: 'once' },
   { label: 'Allow for this session', action: 'session' },
+  { label: 'Keep blocked', action: 'abort' },
+];
+
+const XD_WRITE_OPTIONS: PromptOption[] = [
+  { label: 'Allow once', action: 'once' },
+  { label: 'Allow for this session', action: 'session' },
+  { label: 'Keep blocked', action: 'abort' },
+];
+
+// Remote and non-fs internal targets have no durable policy slot yet, so only
+// per-call allowance is offered.
+const REMOTE_WRITE_OPTIONS: PromptOption[] = [
+  { label: 'Allow once', action: 'once' },
   { label: 'Keep blocked', action: 'abort' },
 ];
 
@@ -583,6 +603,7 @@ function createLandstripIntegrationWithPrompts(
   const sessionAllowedReadPaths: string[] = [];
   const sessionAllowedWritePaths: string[] = [];
   const sessionAllowedTargets: string[] = [];
+  const sessionAllowedXdDevices: string[] = [];
   function getEffectiveAllowRead(
     config: SandboxConfig,
     cwd: string,
@@ -1689,6 +1710,51 @@ function createLandstripIntegrationWithPrompts(
       };
     });
 
+    pi.on('tool_call', async (event, ctx) => {
+      if (!ensureSandboxState(ctx)) return;
+      const targets = extractWriteTargets(event.toolName, event.input);
+      if (targets.length === 0) return;
+
+      const cwd = ctx.cwd;
+      const policy = () => {
+        const config = loadConfig(cwd);
+        return {
+          cwd,
+          denyWrite: config.filesystem.denyWrite,
+          denyWriteAlways: config.filesystem.denyWriteAlways,
+          allowWrite: getEffectiveAllowWrite(config),
+          xdDevices: [...DEFAULT_XD_WRITE_DEVICES, ...sessionAllowedXdDevices],
+        };
+      };
+
+      const prompt: WriteGateDeps['prompt'] = (decision, target) =>
+        permissionPrompts
+          .resolve(
+            () => (judgeWriteTarget(target, policy()).action === 'allow' ? true : undefined),
+            async (promptSignal) => {
+              const options =
+                target.kind === 'fs'
+                  ? PERMISSION_OPTIONS
+                  : target.kind === 'xd'
+                    ? XD_WRITE_OPTIONS
+                    : REMOTE_WRITE_OPTIONS;
+              const choice = await showPermissionPrompt(ctx, decision.title, options, promptSignal);
+              if (choice === 'abort' || promptSignal.aborted) return false;
+              if (target.kind === 'fs') {
+                await applyWriteChoice(ctx, choice, decision.displayPath, cwd);
+              } else if (target.kind === 'xd' && choice === 'session' && target.device) {
+                if (!sessionAllowedXdDevices.includes(target.device)) {
+                  sessionAllowedXdDevices.push(target.device);
+                }
+              }
+              return true;
+            },
+          )
+          .then((allowed) => (allowed ? 'allow' : 'deny'));
+
+      return gateWriteTargets(targets, { ...policy(), prompt });
+    });
+
     pi.on('session_start', async (_event, ctx) => {
       activeContext = ctx;
       permissionPrompts.reset();
@@ -1696,6 +1762,7 @@ function createLandstripIntegrationWithPrompts(
       sessionAllowedReadPaths.length = 0;
       sessionAllowedWritePaths.length = 0;
       sessionAllowedTargets.length = 0;
+      sessionAllowedXdDevices.length = 0;
       projectConfigTrusted = ctx.isProjectTrusted();
       const config = loadConfig(ctx.cwd);
       if (!config.enabled) {

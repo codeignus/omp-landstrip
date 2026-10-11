@@ -1,14 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
-import {
-  HL_FILE_HASH_LENGTH,
-  HL_FILE_HASH_SEP,
-  HL_FILE_PREFIX,
-  HL_FILE_SUFFIX,
-} from '@oh-my-pi/hashline/format';
+// Hashline file-header sigils (`[path#XXXX]`), pinned from
+// @oh-my-pi/hashline src/format.ts — frozen protocol constants. Deep
+// omp-family subpath imports do not resolve under omp's legacy extension
+// bundle, so they are inlined rather than imported.
+const HL_FILE_PREFIX = '[';
+const HL_FILE_SUFFIX = ']';
+const HL_FILE_HASH_SEP = '#';
+const HL_FILE_HASH_LENGTH = 4;
 
-import { parseXdUrl } from '@oh-my-pi/pi-coding-agent/internal-urls/xd-protocol';
+// omp internal-urls/xd-protocol parseXdUrl, pinned: omp's extension host
+// bundles a legacy module map where deep pi-coding-agent subpaths do not
+// resolve, so the semantics live here.
+function parseXdUrl(input: string): { name: string | null } | null {
+  const trimmed = input.trim();
+  if (!trimmed.toLowerCase().startsWith('xd://')) return null;
+  const name = trimmed.slice(5);
+  if (name.length === 0) return { name: null };
+  if (/[/?#]/.test(name)) return null;
+  return { name };
+}
 
 export type WriteTargetKind = 'fs' | 'ssh' | 'xd' | 'internal' | 'unknown';
 
